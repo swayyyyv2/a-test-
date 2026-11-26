@@ -12,7 +12,8 @@ if not exist "%DEST%\sunrise.rc" goto bad_target
 
 echo.
 echo Enter the path to an existing Sunrise\resources folder containing the local game resources.
-echo Example: C:\Users\ender\Downloads\Sunrise-merged\Sunrise-merged\Sunrise\resources
+echo Example: D:\Sunrise\Sunrise\resources
+echo Paste paths without surrounding quotes; a trailing backslash is okay.
 set /p "SOURCE=Resources folder: "
 if not defined SOURCE goto bad_source
 for %%I in ("%SOURCE%\.") do set "SOURCE=%%~fI"

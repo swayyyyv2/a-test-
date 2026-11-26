@@ -62,7 +62,8 @@ generated files to Git.
 To prepare a fresh checkout from files already present on your machine, run
 `supply_local_build_resources.cmd`. Enter the target checkout folder (the one containing
 `Sunrise.sln`), then the path to an existing `Sunrise\resources` folder. The helper copies only missing
-resource files. The `.gitignore` keeps those copied files out of commits.
+resource files. The source folder must have resources for this Sunrise build; the helper does not
+download or extract game data. The `.gitignore` keeps the copied data out of commits.
 
 ### Windows
 
@@ -70,7 +71,9 @@ Install Visual Studio 2026 with the **Desktop development with C++** workload. T
 against the v145 toolset and the 10.0.26100 Windows SDK, so check that both are selected in the
 installer.
 
-The easiest route is to open `Sunrise.sln`, select the `Release` `x64` configuration and build.
+To build a downloaded checkout, run `supply_local_build_resources.cmd` first. Then open `Sunrise.sln`
+in Visual Studio 2026, select the `Release` `x64` configuration, and build. Sunrise Studio is not
+needed to compile the C++ project.
 
 To build from a command line, use the Developer PowerShell for VS 2026:
 
