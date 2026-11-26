@@ -59,6 +59,11 @@ item icon and name packs, item rarity data, and the generated investment default
 needs them supplied through your own lawful asset extraction or generation workflow. Do not add the
 generated files to Git.
 
+To prepare a fresh checkout from files already present on your machine, run
+`supply_local_build_resources.cmd` and paste the full path to an existing `Sunrise\resources` folder
+when prompted. The helper copies only missing resource files into this checkout. The `.gitignore`
+keeps those copied files out of commits.
+
 ### Windows
 
 Install Visual Studio 2026 with the **Desktop development with C++** workload. The project builds
