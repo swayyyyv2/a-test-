@@ -1,0 +1,134 @@
+/**
+ * Guards on the two polled key exports. The game scans GetKeyState over its whole key table every
+ * frame, which no window procedure can see, so a visible interface must answer those reads itself.
+ * Only calls from the game image are answered. Dear ImGui reads the real state for its modifiers.
+ */
+
+#include "polled_input_replacements.h"
+
+#include <Windows.h>
+
+#include <atomic>
+#include <cstdint>
+#include <intrin.h>
+
+#include "../../diagnostics/module_range.h"
+#include "../../diagnostics/test_input/test_input.h"
+#include "runtime.h"
+
+namespace sunrise::client::hooks::polled_input {
+namespace {
+
+std::atomic_bool g_interfaceOpen{};
+diagnostics::ModuleRange g_gameRange{};
+/** One key reported held to game code, so an action can be driven through the game's own scan. */
+std::atomic_uint32_t g_forcedKey{kNoForcedKey};
+/** Separate from teleport's injected key so simultaneous actions cannot cancel one another. */
+std::atomic_uint32_t g_dashKey{kNoForcedKey};
+
+/**
+ * @param caller Return address of the call being answered.
+ * @return True when the caller is game code rather than Sunrise or Dear ImGui.
+ */
+[[nodiscard]] bool caller_is_game(const void* caller) noexcept {
+    return diagnostics::contains(g_gameRange, reinterpret_cast<std::uintptr_t>(caller));
+}
+
+/**
+ * @param virtualKey Key the game is asking about.
+ * @return True while this key is being reported held on the game's behalf.
+ */
+[[nodiscard]] bool is_forced(int virtualKey) noexcept {
+    const std::uint32_t forced = g_forcedKey.load(std::memory_order_relaxed);
+    const std::uint32_t dash = g_dashKey.load(std::memory_order_relaxed);
+    return (forced != kNoForcedKey && static_cast<std::uint32_t>(virtualKey) == forced)
+           || (dash != kNoForcedKey && static_cast<std::uint32_t>(virtualKey) == dash);
+}
+
+} // namespace
+
+std::array<hooking::detour::Handle, kHandleCount> g_handles{};
+std::array<void*, kHandleCount> g_targets{};
+
+/**
+ * Reports every key released to game code while the interface is open.
+ * The scan writes an up-bit from a zero result, so held keys release instead of latching down.
+ * @param virtualKey Windows virtual-key code.
+ * @return Released to the game while the interface is open or in a test process, held for the
+ *         forced key, else the real state.
+ */
+__declspec(noinline) SHORT WINAPI get_key_state(int virtualKey) noexcept {
+    if (caller_is_game(_ReturnAddress())) {
+        if (g_interfaceOpen.load(std::memory_order_relaxed)) {
+            return kKeyReleased;
+        }
+        if (is_forced(virtualKey)) {
+            return kKeyHeld;
+        }
+        // A test process runs in the background; the user's own keyboard must not reach it.
+        if (diagnostics::test_input::enabled()) {
+            return kKeyReleased;
+        }
+    }
+    const GetKeyState next = original<GetKeyState>(HookSlot::getKeyState);
+    if (next == nullptr) {
+        return kKeyReleased;
+    }
+    return next(virtualKey);
+}
+
+/**
+ * Reports every key released to game code while the interface is open.
+ * @param virtualKey Windows virtual-key code.
+ * @return Released to the game while the interface is open; in a test process only the forced key
+ *         reads held, for every caller; else the real state.
+ */
+__declspec(noinline) SHORT WINAPI get_async_key_state(int virtualKey) noexcept {
+    if (g_interfaceOpen.load(std::memory_order_relaxed) && caller_is_game(_ReturnAddress())) {
+        return kKeyReleased;
+    }
+    // A test process answers only the held test key, to the game and to Sunrise's own features.
+    if (diagnostics::test_input::enabled()) {
+        return is_forced(virtualKey) ? kKeyHeld : kKeyReleased;
+    }
+    const GetAsyncKeyState next = original<GetAsyncKeyState>(HookSlot::getAsyncKeyState);
+    if (next == nullptr) {
+        return kKeyReleased;
+    }
+    return next(virtualKey);
+}
+
+/** Finds the game image range the caller test uses. */
+bool resolve_game_range() noexcept {
+    return diagnostics::module_range(GetModuleHandleW(nullptr), g_gameRange);
+}
+
+/** Drops the game image range. */
+void clear_game_range() noexcept {
+    g_gameRange = diagnostics::ModuleRange{};
+}
+
+/** Applies the polled-input policy for the current interface visibility. */
+void apply_visibility(bool visible) noexcept {
+    g_interfaceOpen.store(visible, std::memory_order_relaxed);
+}
+
+/** Reports one key held to game code until it is released. */
+void hold_key(std::uint32_t virtualKey) noexcept {
+    g_forcedKey.store(virtualKey, std::memory_order_relaxed);
+}
+
+/** Stops reporting any key held on the game's behalf. */
+void release_key() noexcept {
+    g_forcedKey.store(kNoForcedKey, std::memory_order_relaxed);
+}
+
+void hold_dash_key(std::uint32_t virtualKey) noexcept {
+    g_dashKey.store(virtualKey, std::memory_order_relaxed);
+}
+
+void release_dash_key() noexcept {
+    g_dashKey.store(kNoForcedKey, std::memory_order_relaxed);
+}
+
+} // namespace sunrise::client::hooks::polled_input

@@ -1,0 +1,454 @@
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <new>
+#include <utility>
+#include <vector>
+
+#include "../../../core/logging/log.h"
+#include "../../../middleware/content/packages/reader/parallel.h"
+#include "../../../middleware/content/packages/schema/generated/tag_classes_808088.h"
+#include "../../../middleware/content/packages/schema/generated/tag_classes_80809b.h"
+#include "activity_sdk_actor_rsat_inventory_internal.h"
+#include "activity_sdk_actor_sequences.h"
+
+namespace sunrise::client::content::activity::sdk_generation::actor_rsat_inventory {
+namespace {
+
+namespace generated = middleware::content::packages::schema::generated;
+
+/** Heap-owned package reader storage is always closed before release. */
+class ScratchOwner final {
+public:
+    ScratchOwner() noexcept : value_(new(std::nothrow) reader::Scratch()) {}
+
+    ~ScratchOwner() noexcept {
+        if (value_ != nullptr) {
+            reader::close_files(*value_);
+        }
+    }
+
+    ScratchOwner(const ScratchOwner&) = delete;
+    ScratchOwner& operator=(const ScratchOwner&) = delete;
+
+    [[nodiscard]] reader::Scratch* get() const noexcept {
+        return value_.get();
+    }
+
+private:
+    std::unique_ptr<reader::Scratch> value_{};
+};
+
+/**
+ * Reads the RSAT blobs and their schema blobs in parallel and copies them into the context.
+ * Kept blobs die with the lease, so each one is copied before this returns.
+ * @param source Package directory and block keys.
+ * @param scratch Reader storage for the class checks.
+ * @param rsatTags RSAT tags to read, sorted.
+ * @param cancel Optional cancellation probe.
+ * @param cancelContext Probe context.
+ * @param context Receives one prefetched row per blob read.
+ * @return False when a read, a class check or a descriptor array fails, or on cancel.
+ */
+[[nodiscard]] bool prefetch_rsats(const reader::Source& source,
+                                  reader::Scratch& scratch,
+                                  std::span<const std::uint32_t> rsatTags,
+                                  CancelProbe cancel,
+                                  void* cancelContext,
+                                  PackageReadContext& context) {
+    const reader::parallel::ScopedRead parallelReads{};
+    std::vector<reader::parallel::Held> held{};
+    if (!reader::parallel::read_kept(source, rsatTags, held)) {
+        return false;
+    }
+    std::vector<std::uint32_t> schemaTags{};
+    context.prefetched.reserve(held.size());
+    for (const reader::parallel::Held& row : held) {
+        std::uint32_t classId = 0;
+        TypedArray descriptors{};
+        if (!reader::read_tag_class(source, scratch, row.tag, classId) || classId != kActorRsatClass
+            || !typed_array(row.blob,
+                            kRsatDescriptorArrayOffset,
+                            generated::RsatDescriptor::kClass,
+                            kDescriptorStride,
+                            descriptors)) {
+            return false;
+        }
+        for (std::uint32_t ordinal = 0; ordinal < descriptors.count; ++ordinal) {
+            const std::size_t offset = static_cast<std::size_t>(descriptors.dataOffset)
+                                       + static_cast<std::size_t>(ordinal) * kDescriptorStride;
+            std::uint32_t schemaTag = 0;
+            if (!read_value(row.blob, offset + kDescriptorSchemaOffset, schemaTag)
+                || is_absent_tag(schemaTag)) {
+                return false;
+            }
+            schemaTags.push_back(schemaTag);
+        }
+        PrefetchedTag cached{};
+        cached.bytes.assign(row.blob.begin(), row.blob.end());
+        cached.classId = kActorRsatClass;
+        if (!context.prefetched.emplace(row.tag, std::move(cached)).second) {
+            return false;
+        }
+    }
+    std::sort(schemaTags.begin(), schemaTags.end());
+    schemaTags.erase(std::unique(schemaTags.begin(), schemaTags.end()), schemaTags.end());
+    if (is_cancelled(cancel, cancelContext)
+        || !reader::parallel::read_kept(source, schemaTags, held)) {
+        return false;
+    }
+    context.prefetched.reserve(context.prefetched.size() + held.size());
+    for (const reader::parallel::Held& row : held) {
+        std::uint32_t classId = 0;
+        if (!reader::read_tag_class(source, scratch, row.tag, classId)
+            || classId != generated::SReplicationSchema::kClass) {
+            return false;
+        }
+        PrefetchedTag cached{};
+        cached.bytes.assign(row.blob.begin(), row.blob.end());
+        cached.classId = generated::SReplicationSchema::kClass;
+        if (!context.prefetched.emplace(row.tag, std::move(cached)).second) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+/** Builds an inventory from an already complete, sorted actor-definition tag set. */
+bool build_from_tags_and_rsats(const decode_plans::Image& image,
+                               std::span<const std::uint32_t> actorTags,
+                               std::span<const std::uint32_t> rsatTags,
+                               ReadTag readTag,
+                               void* readContext,
+                               CancelProbe cancel,
+                               void* cancelContext,
+                               Snapshot& output,
+                               std::span<const SequenceTableSource> sequenceTables) noexcept {
+    output = {};
+    if (actorTags.empty() || readTag == nullptr || is_cancelled(cancel, cancelContext)) {
+        return false;
+    }
+    for (std::size_t index = 0; index < actorTags.size(); ++index) {
+        if (is_absent_tag(actorTags[index])
+            || (index != 0 && actorTags[index - 1U] >= actorTags[index])) {
+            return false;
+        }
+    }
+    for (std::size_t index = 0; index < rsatTags.size(); ++index) {
+        if (is_absent_tag(rsatTags[index])
+            || (index != 0 && rsatTags[index - 1U] >= rsatTags[index])) {
+            return false;
+        }
+    }
+
+    try {
+        BuildState state{};
+        state.readTag = readTag;
+        state.readContext = readContext;
+        state.cancel = cancel;
+        state.cancelContext = cancelContext;
+        state.snapshot.actorClasses.reserve(actorTags.size());
+        state.schemaSources.reserve(actorTags.size() + rsatTags.size());
+        state.schemaIndexes.reserve(actorTags.size() + rsatTags.size());
+        state.rsatTags.reserve(actorTags.size());
+        if (!add_engine_semantics(state.snapshot) || !add_runtime_schemas(image, state.snapshot)) {
+            return false;
+        }
+
+        for (const auto& source : sequenceTables) {
+            std::uint32_t table = format::kAbsentIndex;
+            if (is_absent_tag(source.definitionTag)
+                || !sequence_inventory::table(state, source, table)) {
+                return false;
+            }
+        }
+
+        for (std::size_t actorIndex = 0; actorIndex < actorTags.size(); ++actorIndex) {
+            if (is_cancelled(cancel, cancelContext)
+                || actorIndex > (std::numeric_limits<std::uint32_t>::max)()
+                || state.snapshot.descriptors.size()
+                       > (std::numeric_limits<std::uint32_t>::max)()) {
+                return false;
+            }
+            const std::uint32_t actorTag = actorTags[actorIndex];
+            std::vector<std::byte> actorBlob{};
+            if (!readTag(readContext, actorTag, kActorClassDefinitionClass, actorBlob)
+                || actorBlob.size() < kActorDefinitionMinimumSize) {
+                return false;
+            }
+
+            ActorClass actor{};
+            actor.definitionTag = actorTag;
+            actor.descriptors.first = static_cast<std::uint32_t>(state.snapshot.descriptors.size());
+            std::uint8_t objectType = 0;
+            sequence_inventory::ActorComponents components{};
+            if (!format_actor_id(actorTag, actor.id)
+                || !read_value(actorBlob, kActorNameHashOffset, actor.nameHash)
+                || !read_value(actorBlob, kActorRsatTagOffset, actor.rsatTag)
+                || !read_value(actorBlob, kActorObjectTypeOffset, objectType)
+                || !sequence_inventory::components(state, actorBlob, components)) {
+                return false;
+            }
+            actor.objectType = objectType;
+            actor.authoredSpawnProfile = components.spawnProfile;
+            ActorBehaviorProfile profile{};
+            profile.actorClassIndex = static_cast<std::uint32_t>(actorIndex);
+            profile.behaviorConfigTag = components.behaviorConfigTag;
+            profile.defaultFaction = 0;
+            profile.flags = format::kActorBehaviorProfileExact;
+            if (is_absent_tag(profile.behaviorConfigTag)) {
+                profile.behaviorConfigClass = format::kAbsentIndex;
+                profile.behaviorProvenance = format::ActorSemanticProvenance::notPresent;
+            } else {
+                profile.behaviorConfigClass = generated::SEntityConfig::kClass;
+            }
+            state.snapshot.behaviorProfiles.push_back(profile);
+            if (!sequence_inventory::actor(state, static_cast<std::uint32_t>(actorIndex), actorBlob)
+                || !collect_state_names(state, static_cast<std::uint32_t>(actorIndex), actorBlob)) {
+                return false;
+            }
+            if (is_absent_tag(actor.rsatTag)) {
+                state.snapshot.actorClasses.push_back(actor);
+                continue;
+            }
+            if (!state.rsatTags.emplace(actor.rsatTag).second) {
+                return false;
+            }
+
+            std::vector<std::byte> rsatBlob{};
+            TypedArray descriptorArray{};
+            if (!readTag(readContext, actor.rsatTag, kActorRsatClass, rsatBlob)
+                || !read_value(
+                    rsatBlob, kActorRsatReverseDefinitionOffset, actor.rsatReverseDefinitionTag)
+                || actor.rsatReverseDefinitionTag != actorTag
+                || !typed_array(rsatBlob,
+                                kRsatDescriptorArrayOffset,
+                                generated::RsatDescriptor::kClass,
+                                kDescriptorStride,
+                                descriptorArray)) {
+                return false;
+            }
+            actor.descriptorArrayOffset = kRsatDescriptorArrayOffset;
+            actor.descriptorArrayRelative = descriptorArray.relative;
+            actor.descriptorArrayHeaderOffset = descriptorArray.headerOffset;
+            actor.descriptorArrayDataOffset = descriptorArray.dataOffset;
+            actor.descriptorElementClass = descriptorArray.elementClass;
+            actor.descriptors.count = descriptorArray.count;
+            if (descriptorArray.count
+                > (std::numeric_limits<std::uint32_t>::max)() - state.snapshot.descriptors.size()) {
+                return false;
+            }
+
+            std::uint32_t tailOrdinal = 0;
+            for (std::uint32_t ordinal = 0; ordinal < descriptorArray.count; ++ordinal) {
+                const std::size_t offset = static_cast<std::size_t>(descriptorArray.dataOffset)
+                                           + static_cast<std::size_t>(ordinal) * kDescriptorStride;
+                RsatDescriptor descriptor{};
+                descriptor.actorClassIndex = static_cast<std::uint32_t>(actorIndex);
+                descriptor.rsatTag = actor.rsatTag;
+                descriptor.descriptorOrdinal = ordinal;
+                descriptor.descriptorElementClass = generated::RsatDescriptor::kClass;
+                if (!format_descriptor_id(actor.rsatTag, ordinal, descriptor.id)
+                    || !to_u32(offset, descriptor.descriptorOffset)) {
+                    return false;
+                }
+                std::copy_n(
+                    rsatBlob.data() + offset, descriptor.rawRow.size(), descriptor.rawRow.begin());
+                std::memcpy(&descriptor.componentTag,
+                            descriptor.rawRow.data(),
+                            sizeof descriptor.componentTag);
+                std::memcpy(&descriptor.schemaTag,
+                            descriptor.rawRow.data() + kDescriptorSchemaOffset,
+                            sizeof descriptor.schemaTag);
+                std::size_t schemaSourceIndex = 0;
+                if (!schema(state, descriptor.schemaTag, schemaSourceIndex)) {
+                    return false;
+                }
+                const RsatSchema& schemaRow = state.schemaSources[schemaSourceIndex].row;
+                descriptor.schemaFieldCount = schemaRow.fieldCount;
+                descriptor.schemaFirstFieldRuntimeGate = schemaRow.firstFieldRuntimeGate;
+                descriptor.schemaFirstFieldRawU32At10 = schemaRow.firstFieldRawU32At10;
+                if ((schemaRow.flags & format::kRsatSchemaDynamicPresenceEligible) != 0) {
+                    descriptor.flags |= format::kRsatDescriptorDynamicPresenceEligible;
+                    descriptor.dynamicPresenceTailOrdinal = tailOrdinal++;
+                }
+                state.snapshot.descriptors.push_back(descriptor);
+            }
+            actor.dynamicPresenceTailCount = tailOrdinal;
+            state.snapshot.actorClasses.push_back(actor);
+        }
+
+        std::vector<std::uint32_t> installedRsats(rsatTags.begin(), rsatTags.end());
+        installedRsats.reserve(installedRsats.size() + state.rsatTags.size());
+        installedRsats.insert(installedRsats.end(), state.rsatTags.begin(), state.rsatTags.end());
+        std::sort(installedRsats.begin(), installedRsats.end());
+        installedRsats.erase(std::unique(installedRsats.begin(), installedRsats.end()),
+                             installedRsats.end());
+        state.snapshot.sobjectRsats.reserve(installedRsats.size());
+        for (const std::uint32_t rsatTag : installedRsats) {
+            if (!sobject_rsat(state, rsatTag)) {
+                return false;
+            }
+        }
+
+        std::sort(state.schemaSources.begin(),
+                  state.schemaSources.end(),
+                  [](const SchemaSource& first, const SchemaSource& second) {
+                      return first.row.schemaTag < second.row.schemaTag;
+                  });
+        state.schemaIndexes.clear();
+        state.schemaIndexes.reserve(state.schemaSources.size());
+        state.snapshot.schemas.reserve(state.schemaSources.size());
+        for (std::size_t index = 0; index < state.schemaSources.size(); ++index) {
+            SchemaSource& source = state.schemaSources[index];
+            if (index > (std::numeric_limits<std::uint32_t>::max)()
+                || state.snapshot.fields.size() > (std::numeric_limits<std::uint32_t>::max)()
+                || source.fields.size() > (std::numeric_limits<std::uint32_t>::max)()
+                || source.fields.size()
+                       > (std::numeric_limits<std::uint32_t>::max)() - state.snapshot.fields.size()
+                || !state.schemaIndexes.emplace(source.row.schemaTag, index).second) {
+                return false;
+            }
+            source.row.fields.first = static_cast<std::uint32_t>(state.snapshot.fields.size());
+            source.row.fields.count = static_cast<std::uint32_t>(source.fields.size());
+            state.snapshot.schemas.push_back(source.row);
+            state.snapshot.fields.insert(
+                state.snapshot.fields.end(), source.fields.begin(), source.fields.end());
+        }
+        state.snapshot.sobjectRsatFieldBindings.reserve(state.snapshot.fields.size());
+        for (std::size_t index = 0; index < state.snapshot.fields.size(); ++index) {
+            if (index > (std::numeric_limits<std::uint32_t>::max)()) {
+                return false;
+            }
+            const RsatField& field = state.snapshot.fields[index];
+            SobjectRsatFieldBinding binding{};
+            binding.rsatFieldIndex = static_cast<std::uint32_t>(index);
+            std::memcpy(&binding.runtimeSchemaHandle,
+                        field.rawRow.data() + kFieldRawU32At10Offset,
+                        sizeof binding.runtimeSchemaHandle);
+            std::memcpy(&binding.parameter14,
+                        field.rawRow.data() + kFieldRepeatOffset,
+                        sizeof binding.parameter14);
+            // The pack keeps the child count as a u32.
+            std::int64_t childCount = 0;
+            std::memcpy(
+                &childCount, field.rawRow.data() + kFieldChildrenCountOffset, sizeof childCount);
+            if (childCount < 0 || childCount > (std::numeric_limits<std::uint32_t>::max)()) {
+                return false;
+            }
+            binding.parameter18 = static_cast<std::uint32_t>(childCount);
+            // TODO: rename decodedOffset to childrenRelative in format.h; it needs a pack bump.
+            std::memcpy(&binding.decodedOffset,
+                        field.rawRow.data() + kFieldChildrenRelativeOffset,
+                        sizeof binding.decodedOffset);
+            binding.flags = format::kSobjectRsatFieldBindingExact;
+            if (binding.runtimeSchemaHandle != format::kAbsentIndex) {
+                // Runtime schemas are sorted by handle.
+                const auto runtime = std::lower_bound(
+                    state.snapshot.runtimeSchemas.begin(),
+                    state.snapshot.runtimeSchemas.end(),
+                    binding.runtimeSchemaHandle,
+                    [](const auto& row, auto value) { return row.handle < value; });
+                if (runtime == state.snapshot.runtimeSchemas.end()
+                    || runtime->handle != binding.runtimeSchemaHandle) {
+                    core::log::writef(core::log::Channel::client,
+                                      core::log::Level::error,
+                                      "ev=actor_rsat stage=field_binding result=failed "
+                                      "reason=unknown_runtime_schema handle=0x%08X",
+                                      binding.runtimeSchemaHandle);
+                    return false;
+                }
+                binding.definitionClass = runtime->definitionClass;
+                binding.codecFamilies = runtime->codecFamilies;
+                binding.flags |= format::kSobjectRsatFieldBindingHasRuntimeSchema;
+            }
+            state.snapshot.sobjectRsatFieldBindings.push_back(binding);
+        }
+        for (RsatDescriptor& descriptor : state.snapshot.descriptors) {
+            const auto found = state.schemaIndexes.find(descriptor.schemaTag);
+            if (found == state.schemaIndexes.end()
+                || found->second > (std::numeric_limits<std::uint32_t>::max)()) {
+                return false;
+            }
+            descriptor.schemaIndex = static_cast<std::uint32_t>(found->second);
+        }
+        for (SobjectRsatDescriptor& descriptor : state.snapshot.sobjectRsatDescriptors) {
+            const auto found = state.schemaIndexes.find(descriptor.schemaTag);
+            if (found == state.schemaIndexes.end()
+                || found->second > (std::numeric_limits<std::uint32_t>::max)()) {
+                return false;
+            }
+            descriptor.schemaIndex = static_cast<std::uint32_t>(found->second);
+        }
+
+        if (!sequence_inventory::finish_names(state.snapshot)) {
+            return false;
+        }
+        state.snapshot.complete = true;
+        if (!validate(state.snapshot)) {
+            return false;
+        }
+        output = std::move(state.snapshot);
+        return true;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+bool build_from_tags(const decode_plans::Image& image,
+                     std::span<const std::uint32_t> actorTags,
+                     ReadTag readTag,
+                     void* readContext,
+                     CancelProbe cancel,
+                     void* cancelContext,
+                     Snapshot& output) noexcept {
+    return build_from_tags_and_rsats(
+        image, actorTags, {}, readTag, readContext, cancel, cancelContext, output);
+}
+
+/** Prefetches the sorted installed RSAT rows, then builds the actor inventory from tags. */
+bool build_with_rsats(const reader::Source& source,
+                      const decode_plans::Image& image,
+                      std::span<const std::uint32_t> actorTags,
+                      std::span<const std::uint32_t> rsatTags,
+                      CancelProbe cancel,
+                      void* cancelContext,
+                      Snapshot& output) noexcept {
+    output = {};
+    if (source.directory.empty() || source.keys == nullptr || actorTags.empty()
+        || is_cancelled(cancel, cancelContext)) {
+        return false;
+    }
+    try {
+        ScratchOwner scratch{};
+        if (scratch.get() == nullptr) {
+            return false;
+        }
+        PackageReadContext context{&source, scratch.get()};
+        if (!prefetch_rsats(source, *scratch.get(), rsatTags, cancel, cancelContext, context)) {
+            return false;
+        }
+        std::vector<SequenceTableSource> sequenceTables;
+        if (!sequence_inventory::scan_tables(source, sequenceTables)) {
+            return false;
+        }
+        return build_from_tags_and_rsats(image,
+                                         actorTags,
+                                         rsatTags,
+                                         &package_read,
+                                         &context,
+                                         cancel,
+                                         cancelContext,
+                                         output,
+                                         sequenceTables);
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+} // namespace sunrise::client::content::activity::sdk_generation::actor_rsat_inventory

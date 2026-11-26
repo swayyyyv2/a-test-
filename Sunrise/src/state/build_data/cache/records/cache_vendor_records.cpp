@@ -1,0 +1,183 @@
+#include <algorithm>
+#include <span>
+
+#include "codec.h"
+
+namespace sunrise::state::build_data::cache::records {
+
+/** Encodes one vendor index row. */
+bool encode(const vendors::IndexEntry& value, VendorIndexRecord& record) noexcept {
+    record = {};
+    record.definitionHash = value.definitionHash;
+    record.definitionTag = value.definitionTag;
+    record.index = value.index;
+    return true;
+}
+
+/** Decodes one vendor index row. */
+bool decode(const VendorIndexRecord& record, vendors::IndexEntry& value) noexcept {
+    value = {};
+    if (record.reserved != 0) {
+        return false;
+    }
+    value = {record.definitionHash, record.definitionTag, record.index};
+    return true;
+}
+
+/** Encodes one vendor definition and its flat-bank ranges. */
+bool encode(const vendors::Definition& value, VendorDefinitionRecord& record) noexcept {
+    record = {};
+    record.definitionHash = value.definitionHash;
+    record.definitionTag = value.definitionTag;
+    record.definitionClass = value.definitionClass;
+    record.definitionSize = value.definitionSize;
+    record.installedRowBase = value.installedRowBase;
+    record.installedRowClass = value.installedRowClass;
+    record.saleRowBase = value.saleRowBase;
+    record.saleRowClass = value.saleRowClass;
+    record.interactionRowBase = value.interactionRowBase;
+    record.interactionRowClass = value.interactionRowClass;
+    record.saleRowOffset = value.saleRowOffset;
+    record.installedRowOffset = value.installedRowOffset;
+    record.transferRuleOffset = value.transferRuleOffset;
+    record.resetIntervalRaw = value.resetIntervalRaw;
+    record.resetPhaseRaw = value.resetPhaseRaw;
+    record.index = value.index;
+    record.installedCount = value.installedCount;
+    record.saleCount = value.saleCount;
+    record.interactionCount = value.interactionCount;
+    record.factionIndexRaw = value.factionIndexRaw;
+    record.factionProgressionIndex = value.factionProgressionIndex;
+    record.factionHash = value.factionHash;
+    record.transferRuleCount = value.transferRuleCount;
+    return true;
+}
+
+/** Decodes one vendor definition and its flat-bank ranges. */
+bool decode(const VendorDefinitionRecord& record, vendors::Definition& value) noexcept {
+    value = {};
+    // The catalog checks every range against the whole domain. Only the class is checked here.
+    // A row of another class is not a vendor definition, whatever its ranges say.
+    if (record.definitionClass != vendors::kDefinitionClass) {
+        return false;
+    }
+    value.definitionHash = record.definitionHash;
+    value.definitionTag = record.definitionTag;
+    value.definitionClass = record.definitionClass;
+    value.definitionSize = record.definitionSize;
+    value.installedRowBase = record.installedRowBase;
+    value.installedRowClass = record.installedRowClass;
+    value.saleRowBase = record.saleRowBase;
+    value.saleRowClass = record.saleRowClass;
+    value.interactionRowBase = record.interactionRowBase;
+    value.interactionRowClass = record.interactionRowClass;
+    value.saleRowOffset = record.saleRowOffset;
+    value.installedRowOffset = record.installedRowOffset;
+    value.transferRuleOffset = record.transferRuleOffset;
+    value.resetIntervalRaw = record.resetIntervalRaw;
+    value.resetPhaseRaw = record.resetPhaseRaw;
+    value.index = record.index;
+    value.installedCount = record.installedCount;
+    value.saleCount = record.saleCount;
+    value.interactionCount = record.interactionCount;
+    value.factionIndexRaw = record.factionIndexRaw;
+    value.factionProgressionIndex = record.factionProgressionIndex;
+    value.factionHash = record.factionHash;
+    value.transferRuleCount = record.transferRuleCount;
+    return true;
+}
+
+/** Encodes one vendor sale row. Unused cost entries stay zero so the packed row always matches. */
+bool encode(const vendors::SaleRow& value, VendorSaleRowRecord& record) noexcept {
+    record = {};
+    if (value.costCount > value.costs.size()) {
+        return false;
+    }
+    record.itemIndex = value.itemIndex;
+    record.secondaryItemIndex = value.secondaryItemIndex;
+    record.categoryIndex = value.categoryIndex;
+    record.costCount = value.costCount;
+    record.priceState = static_cast<std::uint8_t>(value.priceState);
+    for (std::size_t cost = 0; cost < value.costCount; ++cost) {
+        record.costs[cost].itemIndex = value.costs[cost].itemIndex;
+        record.costs[cost].quantity = value.costs[cost].quantity;
+    }
+    record.availabilityCount = value.availabilityCount;
+    record.availabilityUnreadable = static_cast<std::uint8_t>(value.availabilityUnreadable);
+    if (record.availabilityCount > record.availability.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < record.availability.size(); ++i) {
+        if (!encode(value.availability[i], record.availability[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Decodes one vendor sale row. */
+bool decode(const VendorSaleRowRecord& record, vendors::SaleRow& value) noexcept {
+    value = {};
+    if (record.costCount > record.costs.size()
+        || record.priceState > static_cast<std::uint8_t>(vendors::PriceState::unreadable)
+        || record.availabilityCount > record.availability.size()
+        || record.availabilityUnreadable > 1) {
+        return false;
+    }
+    const auto unused = std::span(record.availability).subspan(record.availabilityCount);
+    if (!std::all_of(unused.begin(), unused.end(), unused_condition)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < record.availabilityCount; ++i) {
+        if (!decode(record.availability[i], value.availability[i])) {
+            return false;
+        }
+    }
+    for (std::size_t cost = 0; cost < record.costs.size(); ++cost) {
+        const VendorSaleCostRecord& stored = record.costs[cost];
+        if (stored.reserved != 0) {
+            return false;
+        }
+        if (cost >= record.costCount) {
+            if (stored.itemIndex != 0 || stored.quantity != 0) {
+                return false;
+            }
+            continue;
+        }
+        value.costs[cost] = {stored.itemIndex, stored.quantity};
+    }
+    value.itemIndex = record.itemIndex;
+    value.secondaryItemIndex = record.secondaryItemIndex;
+    value.categoryIndex = record.categoryIndex;
+    value.costCount = record.costCount;
+    value.priceState = static_cast<vendors::PriceState>(record.priceState);
+    value.availabilityCount = record.availabilityCount;
+    value.availabilityUnreadable = record.availabilityUnreadable != 0;
+    return true;
+}
+
+/** Encodes one vendor category row. */
+bool encode(const vendors::InstalledRow& value, VendorInstalledRowRecord& record) noexcept {
+    record = {value.definitionHash};
+    return true;
+}
+
+/** Decodes one vendor category row. */
+bool decode(const VendorInstalledRowRecord& record, vendors::InstalledRow& value) noexcept {
+    value = {record.definitionHash};
+    return true;
+}
+
+/** Encodes one vendor transfer rule. */
+bool encode(const vendors::TransferRule& value, VendorTransferRuleRecord& record) noexcept {
+    record = {value.sourceBucket, value.destinationBucket};
+    return true;
+}
+
+/** Decodes one vendor transfer rule. */
+bool decode(const VendorTransferRuleRecord& record, vendors::TransferRule& value) noexcept {
+    value = {record.sourceBucket, record.destinationBucket};
+    return true;
+}
+
+} // namespace sunrise::state::build_data::cache::records

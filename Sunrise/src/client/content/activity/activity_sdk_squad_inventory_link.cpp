@@ -1,0 +1,876 @@
+#include <Windows.h>
+
+#include <algorithm>
+#include <array>
+#include <bcrypt.h>
+#include <cstdio>
+#include <limits>
+#include <map>
+#include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+
+#include "../../../middleware/content/packages/schema/generated/tag_classes_80807e.h"
+#include "../../../middleware/content/packages/schema/generated/tag_classes_80809a.h"
+#include "../../../middleware/crypto/sha256.h"
+#include "activity_sdk_squad_graph.h"
+#include "activity_sdk_squad_inventory.h"
+#include "activity_sdk_squad_inventory_internal.h"
+#include "activity_sdk_squad_occurrence_rule.h"
+
+namespace sunrise::client::content::activity::sdk_generation::squad_inventory {
+namespace {
+
+namespace generated = middleware::content::packages::schema::generated;
+
+namespace crypto = middleware::crypto::sha256;
+namespace topology = topology_inventory;
+
+/** One reusable CNG hash operation for the hundreds of thousands of canonical squad ids. */
+class SquadIdHasher final {
+public:
+    /** Opens the reusable CNG hash; the object stays not ready when CNG refuses. */
+    SquadIdHasher() noexcept {
+        if (BCryptOpenAlgorithmProvider(&algorithm_, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0
+            || BCryptCreateHash(
+                   algorithm_, &hash_, nullptr, 0, nullptr, 0, BCRYPT_HASH_REUSABLE_FLAG)
+                   < 0) {
+            if (algorithm_ != nullptr) {
+                BCryptCloseAlgorithmProvider(algorithm_, 0);
+            }
+            algorithm_ = nullptr;
+            hash_ = nullptr;
+        }
+    }
+
+    ~SquadIdHasher() noexcept {
+        if (hash_ != nullptr) {
+            BCryptDestroyHash(hash_);
+        }
+        if (algorithm_ != nullptr) {
+            BCryptCloseAlgorithmProvider(algorithm_, 0);
+        }
+    }
+
+    SquadIdHasher(const SquadIdHasher&) = delete;
+    SquadIdHasher& operator=(const SquadIdHasher&) = delete;
+
+    [[nodiscard]] bool ready() const noexcept {
+        return algorithm_ != nullptr && hash_ != nullptr;
+    }
+
+    /** Hashes one whole span. @return False when the hash is not ready or the span is too long. */
+    [[nodiscard]] bool hash(std::span<const std::byte> input, crypto::Digest& output) noexcept {
+        return ready() && input.size() <= (std::numeric_limits<ULONG>::max)()
+               && BCryptHashData(hash_,
+                                 reinterpret_cast<PUCHAR>(const_cast<std::byte*>(input.data())),
+                                 static_cast<ULONG>(input.size()),
+                                 0)
+                      >= 0
+               && BCryptFinishHash(hash_,
+                                   reinterpret_cast<PUCHAR>(output.data()),
+                                   static_cast<ULONG>(output.size()),
+                                   0)
+                      >= 0;
+    }
+
+private:
+    BCRYPT_ALG_HANDLE algorithm_{};
+    BCRYPT_HASH_HANDLE hash_{};
+};
+
+/** One exact spawner-to-rule edge before scenario rows are emitted. */
+struct Edge final {
+    const SpawnerFact* spawner{};
+    const RuleFact* rule{};
+    const DescriptorFact* sourceDescriptor{};
+    const DescriptorFact* targetDescriptor{};
+    std::string id{};
+    std::vector<std::uint32_t> scenarios{};
+    std::vector<std::uint32_t> geometryScenarios{};
+    std::vector<std::uint32_t> provedOccurrences{};
+    std::uint32_t spawnerRow{format::kAbsentIndex};
+    std::uint32_t sourceDescriptorRow{format::kAbsentIndex};
+    bool associationExact{};
+};
+
+/** One pending squad keeps child rows owned until canonical sorting finishes. */
+struct PendingSquad final {
+    Squad row{};
+    std::vector<SquadMember> members{};
+    std::vector<SquadAnchor> anchors{};
+};
+
+using detail::append_hash_part;
+using detail::append_little;
+using detail::format_text;
+using detail::text_view;
+
+/** Replays the SDK builder's typed SHA-256 domain hash. */
+[[nodiscard]] bool domain_hash(SquadIdHasher& hasher,
+                               std::string_view domain,
+                               std::span<const std::string_view> parts,
+                               std::string& output) {
+    output.clear();
+    std::vector<std::byte> input{};
+    try {
+        if (!append_little(input, static_cast<std::uint32_t>(domain.size()))) {
+            return false;
+        }
+        input.reserve(input.size() + domain.size());
+        for (const unsigned char byte : domain) {
+            input.push_back(static_cast<std::byte>(byte));
+        }
+        for (const std::string_view part : parts) {
+            if (!append_hash_part(input, part)) {
+                return false;
+            }
+        }
+    } catch (...) {
+        return false;
+    }
+    crypto::Digest digest{};
+    if (!hasher.hash(input, digest)) {
+        return false;
+    }
+    // Squad ids are published in lowercase hex.
+    static constexpr std::array<char, 16> kHex{
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    output.resize(digest.size() * 2U);
+    for (std::size_t index = 0; index < digest.size(); ++index) {
+        const auto value = static_cast<unsigned char>(digest[index]);
+        output[index * 2U] = kHex[value >> 4U];
+        output[index * 2U + 1U] = kHex[value & 0xFU];
+    }
+    return true;
+}
+
+/** One scenario and exact placed-entry identity lookup key. */
+struct PlacementKey final {
+    std::uint32_t scenarioIndex{};
+    std::uint64_t identity{};
+
+    bool operator==(const PlacementKey&) const = default;
+};
+
+/** Hashes one occurrence-local placement lookup key. */
+struct PlacementKeyHash final {
+    [[nodiscard]] std::size_t operator()(const PlacementKey& value) const noexcept {
+        const std::uint64_t mixed = value.identity ^ (value.identity >> 32U)
+                                    ^ (static_cast<std::uint64_t>(value.scenarioIndex) << 13U);
+        return static_cast<std::size_t>(mixed);
+    }
+};
+
+/** One authored config's occurrences for a specific world object and scenario. */
+struct ConfigOccurrenceKey final {
+    std::uint32_t configTag{};
+    std::uint32_t objectIndex{};
+    std::uint32_t scenarioIndex{};
+
+    bool operator==(const ConfigOccurrenceKey&) const = default;
+};
+
+struct ConfigOccurrenceKeyHash final {
+    [[nodiscard]] std::size_t operator()(const ConfigOccurrenceKey& value) const noexcept {
+        return static_cast<std::size_t>(value.configTag)
+               ^ (static_cast<std::size_t>(value.objectIndex) << 11U)
+               ^ (static_cast<std::size_t>(value.scenarioIndex) << 23U);
+    }
+};
+
+/** Counts duplicate uses of one config in one occurrence without rescanning its config bucket. */
+struct ConfigOccurrenceCountKey final {
+    std::uint32_t configTag{};
+    std::uint32_t occurrenceIndex{};
+
+    bool operator==(const ConfigOccurrenceCountKey&) const = default;
+};
+
+struct ConfigOccurrenceCountKeyHash final {
+    [[nodiscard]] std::size_t operator()(const ConfigOccurrenceCountKey& value) const noexcept {
+        return static_cast<std::size_t>(value.configTag)
+               ^ (static_cast<std::size_t>(value.occurrenceIndex) << 17U);
+    }
+};
+
+/** Tests one output squad's natural identity before child ranges are assigned. */
+[[nodiscard]] auto squad_natural(const PendingSquad& value) noexcept {
+    return std::tuple(value.row.scenarioIndex,
+                      value.row.occurrenceIndex,
+                      value.row.objectIndex,
+                      value.row.slotIndex,
+                      value.row.spawnerConfigTag,
+                      value.row.spawnRuleConfigTag);
+}
+
+/**
+ * Tests that one descriptor's whole schema tuple matches its slot's proven schema. The slot type
+ * alone never implies a schema.
+ */
+[[nodiscard]] bool unbound_descriptor_exact(
+    const topology::Snapshot& topology,
+    const std::unordered_map<std::uint32_t, const GraphSlotSchemaProvenance*>& schemas,
+    const GraphDescriptor& descriptor) {
+    if (!descriptor.complete || descriptor.slotIndex >= topology.slots.size()
+        || descriptor.objectIndex >= topology.objects.size()) {
+        return false;
+    }
+    const auto& slot = topology.slots[descriptor.slotIndex];
+    if (slot.objectIndex != descriptor.objectIndex || slot.slotType != format::kSquadSlotType) {
+        return false;
+    }
+    const auto found = schemas.find(descriptor.slotIndex);
+    const auto* match = found == schemas.end() ? nullptr : found->second;
+    return match != nullptr && match->exact && match->componentClass == descriptor.componentClass
+           && match->senseSchema == descriptor.senseSchema
+           && match->authSchema == descriptor.authSchema;
+}
+
+/**
+ * Tests that one occurrence places the descriptor's config exactly once. A config path repeated
+ * in one occurrence is ambiguous, even when every copy has the same coordinates.
+ */
+[[nodiscard]] bool unbound_occurrence_exact(const topology::Snapshot& topology,
+                                            const std::vector<const GraphConfigContext*>& contexts,
+                                            const GraphDescriptor& descriptor,
+                                            std::uint32_t occurrenceIndex) {
+    if (occurrenceIndex >= topology.occurrences.size()) {
+        return false;
+    }
+    const auto& occurrence = topology.occurrences[occurrenceIndex];
+    if (occurrence.objectIndex != descriptor.objectIndex) {
+        return false;
+    }
+    std::uint32_t count = 0;
+    bool exact = false;
+    for (const GraphConfigContext* context : contexts) {
+        if (context->configTag != descriptor.configTag
+            || context->occurrenceIndex != occurrenceIndex) {
+            continue;
+        }
+        ++count;
+        exact = context->complete && context->objectIndex == descriptor.objectIndex
+                && context->scenarioIndex == occurrence.scenarioIndex;
+    }
+    return count == 1 && exact;
+}
+
+/**
+ * Appends one squad per exact occurrence of a spawner that names no rule of its own. Such a squad
+ * has no rule edge or anchors, so it is placeable only with a selected type-66 rule slot. The
+ * authored graph's edges are left untouched.
+ */
+[[nodiscard]] bool project_unbound_squads(const topology::Snapshot& topology,
+                                          const Facts& facts,
+                                          const GraphSnapshot& graph,
+                                          SquadIdHasher& hasher,
+                                          ActorResolver actorResolver,
+                                          void* actorContext,
+                                          std::vector<PendingSquad>& pending) {
+    std::unordered_map<std::uint32_t, const GraphSlotSchemaProvenance*> schemas{};
+    for (const auto& schema : graph.slotSchemas) {
+        if (!schemas.emplace(schema.slotIndex, &schema).second) {
+            return false;
+        }
+    }
+    std::unordered_map<std::uint32_t, std::size_t> spawnersByConfig{};
+    std::unordered_map<std::uint32_t, std::vector<const GraphConfigContext*>> contextsByConfig{};
+    for (std::size_t index = 0; index < graph.spawners.size(); ++index) {
+        if (!spawnersByConfig.emplace(graph.spawners[index].configTag, index).second) {
+            return false;
+        }
+    }
+    for (const auto& context : graph.configContexts) {
+        contextsByConfig[context.configTag].push_back(&context);
+    }
+    for (const auto& descriptor : graph.descriptors) {
+        const auto foundSpawner = spawnersByConfig.find(descriptor.configTag);
+        if (foundSpawner == spawnersByConfig.end()) {
+            continue;
+        }
+        const std::size_t spawnerIndex = foundSpawner->second;
+        if (spawnerIndex >= facts.spawners.size()) {
+            return false;
+        }
+        const GraphSpawner& spawner = graph.spawners[spawnerIndex];
+        const SpawnerFact& source = facts.spawners[spawnerIndex];
+        if (!spawner.requiresSelectedRule) {
+            continue;
+        }
+        if (spawner.configTag != source.configTag) {
+            return false;
+        }
+        if (descriptor.componentClass != generated::SSquadComponent::kClass
+            || descriptor.senseSchema != generated::C80807ecc::kClass
+            || descriptor.authSchema != generated::C80807ec9::kClass
+            || !unbound_descriptor_exact(topology, schemas, descriptor)) {
+            continue;
+        }
+        const auto foundContexts = contextsByConfig.find(descriptor.configTag);
+        if (foundContexts == contextsByConfig.end()) {
+            continue;
+        }
+        std::vector<std::uint32_t> occurrenceIndexes{};
+        for (const GraphConfigContext* context : foundContexts->second) {
+            occurrenceIndexes.push_back(context->occurrenceIndex);
+        }
+        std::sort(occurrenceIndexes.begin(), occurrenceIndexes.end());
+        occurrenceIndexes.erase(std::unique(occurrenceIndexes.begin(), occurrenceIndexes.end()),
+                                occurrenceIndexes.end());
+        for (const std::uint32_t occurrenceIndex : occurrenceIndexes) {
+            if (!unbound_occurrence_exact(
+                    topology, foundContexts->second, descriptor, occurrenceIndex)) {
+                continue;
+            }
+            const auto& occurrence = topology.occurrences[occurrenceIndex];
+            std::string_view occurrenceId{};
+            if (!text_view(occurrence.id, occurrenceId)) {
+                return false;
+            }
+            const std::array<std::string_view, 2> parts{descriptor.id, occurrenceId};
+            std::string digest{};
+            if (!domain_hash(hasher, "sunrise-runtime-unbound-squad-v1", parts, digest)) {
+                return false;
+            }
+            PendingSquad squad{};
+            squad.row.id = "squad/" + digest;
+            squad.row.scenarioIndex = occurrence.scenarioIndex;
+            squad.row.objectIndex = descriptor.objectIndex;
+            squad.row.slotIndex = descriptor.slotIndex;
+            squad.row.spawnerConfigTag = descriptor.configTag;
+            squad.row.spawnRuleConfigTag = format::kAbsentIndex;
+            squad.row.occurrenceIndex = occurrenceIndex;
+            squad.row.flags = format::kSquadRequiresSelectedRule
+                              | format::kSquadSourceDescriptorExact
+                              | format::kSquadScenarioOccurrenceExact;
+            bool sourceActorLinksComplete = true;
+            for (std::uint32_t memberIndex = 0; memberIndex < source.members.size();
+                 ++memberIndex) {
+                SquadMember member{};
+                if (!detail::build_member(source.members[memberIndex],
+                                          digest,
+                                          memberIndex,
+                                          actorResolver,
+                                          actorContext,
+                                          member,
+                                          sourceActorLinksComplete)) {
+                    return false;
+                }
+                squad.members.push_back(std::move(member));
+            }
+            // An unresolved rule-less squad is skipped; it must not fail the authored squads.
+            if (!sourceActorLinksComplete) {
+                continue;
+            }
+            const bool countValid = squad.members.size() >= format::kSquadMinimumMemberCount
+                                    && squad.members.size() <= format::kSquadMaximumMemberCount;
+            if (countValid) {
+                squad.row.flags |= format::kSquadMemberCountValid;
+            }
+            if (countValid
+                && std::all_of(
+                    squad.members.begin(), squad.members.end(), [](const SquadMember& member) {
+                        return (member.flags & format::kSquadMemberInvariantReadyMask)
+                                   == format::kSquadMemberInvariantReadyMask
+                               && member.defaultCount > 0;
+                    })) {
+                squad.row.flags |= format::kSquadCandidateCountsInvariantComplete;
+            }
+            std::vector<std::uint32_t> memberKeys{};
+            memberKeys.reserve(squad.members.size());
+            for (const SquadMember& member : squad.members) {
+                memberKeys.push_back(member.memberKey);
+            }
+            std::sort(memberKeys.begin(), memberKeys.end());
+            if (std::adjacent_find(memberKeys.begin(), memberKeys.end()) != memberKeys.end()) {
+                return false;
+            }
+            // No rule edge or anchors: placement refuses this squad unless a rule slot is selected.
+            pending.push_back(std::move(squad));
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+/** Normalizes the authored graph once, then derives the narrower runnable squad projection. */
+bool link(const topology::Snapshot& topology,
+          const Facts& facts,
+          ActorResolver actorResolver,
+          void* actorContext,
+          Snapshot& output) noexcept {
+    GraphSnapshot graph{};
+    if (!build_graph(topology, facts, graph)) {
+        output = {};
+        return false;
+    }
+    return link(topology, facts, graph, actorResolver, actorContext, output);
+}
+
+/** Links normalized facts to canonical section-16 through section-18 rows. */
+bool link(const topology::Snapshot& topology,
+          const Facts& facts,
+          const GraphSnapshot& graph,
+          ActorResolver actorResolver,
+          void* actorContext,
+          Snapshot& output) noexcept {
+    output = {};
+    if (!detail::valid_topology(topology) || !graph.ready) {
+        return false;
+    }
+    try {
+        if (!detail::validate_facts(topology, facts)
+            || graph.spawners.size() != facts.spawners.size()
+            || graph.rules.size() != facts.rules.size()
+            || graph.descriptors.size() != facts.descriptors.size()
+            || graph.slotSchemas.size() != facts.slotSchemas.size()
+            || graph.configContexts.size() != facts.configOccurrences.size()
+            || graph.placementContexts.size() != facts.placementOccurrences.size()) {
+            return false;
+        }
+
+        SquadIdHasher squadIdHasher{};
+        if (!squadIdHasher.ready()) {
+            return false;
+        }
+
+        std::unordered_map<ConfigOccurrenceKey, std::vector<std::uint32_t>, ConfigOccurrenceKeyHash>
+            occurrencesByConfigObjectScenario{};
+        std::unordered_map<ConfigOccurrenceCountKey, std::uint32_t, ConfigOccurrenceCountKeyHash>
+            configOccurrenceCounts{};
+        occurrencesByConfigObjectScenario.reserve(graph.configContexts.size());
+        configOccurrenceCounts.reserve(graph.configContexts.size());
+        for (const GraphConfigContext& context : graph.configContexts) {
+            if (context.occurrenceIndex >= topology.occurrences.size()) {
+                return false;
+            }
+            const topology::Occurrence& occurrence = topology.occurrences[context.occurrenceIndex];
+            std::string_view occurrenceId{};
+            if (!text_view(occurrence.id, occurrenceId)) {
+                return false;
+            }
+            occurrencesByConfigObjectScenario[{context.configTag,
+                                               occurrence.objectIndex,
+                                               occurrence.scenarioIndex}]
+                .push_back(context.occurrenceIndex);
+            ++configOccurrenceCounts[{context.configTag, context.occurrenceIndex}];
+        }
+        for (auto& [key, occurrences] : occurrencesByConfigObjectScenario) {
+            (void)key;
+            std::sort(occurrences.begin(), occurrences.end(), [&topology](auto first, auto second) {
+                std::string_view firstId{};
+                std::string_view secondId{};
+                return text_view(topology.occurrences[first].id, firstId)
+                       && text_view(topology.occurrences[second].id, secondId)
+                       && firstId < secondId;
+            });
+            occurrences.erase(std::unique(occurrences.begin(), occurrences.end()),
+                              occurrences.end());
+        }
+        std::
+            unordered_map<PlacementKey, std::vector<const GraphPlacementContext*>, PlacementKeyHash>
+                placementsByIdentity{};
+        for (const GraphPlacementContext& placement : graph.placementContexts) {
+            placementsByIdentity[{placement.scenarioIndex, placement.placedEntryIdentity}]
+                .push_back(&placement);
+        }
+        std::unordered_map<std::uint32_t, const GraphSlotSchemaProvenance*> schemasBySlot{};
+        for (const GraphSlotSchemaProvenance& schema : graph.slotSchemas) {
+            schemasBySlot.emplace(schema.slotIndex, &schema);
+        }
+
+        std::vector<Edge> edges{};
+        edges.reserve(graph.edges.size());
+        for (std::uint32_t graphEdgeRow = 0; graphEdgeRow < graph.edges.size(); ++graphEdgeRow) {
+            const GraphEdge& source = graph.edges[graphEdgeRow];
+            if (source.spawnerRow >= facts.spawners.size() || source.ruleRow >= facts.rules.size()
+                || source.sourceDescriptorRow >= facts.descriptors.size()
+                || source.targetDescriptorRow >= facts.descriptors.size()
+                || source.scenarioContexts.first > graph.edgeContexts.size()
+                || source.scenarioContexts.count
+                       > graph.edgeContexts.size() - source.scenarioContexts.first) {
+                return false;
+            }
+            Edge edge{};
+            edge.spawner = &facts.spawners[source.spawnerRow];
+            edge.rule = &facts.rules[source.ruleRow];
+            edge.sourceDescriptor = &facts.descriptors[source.sourceDescriptorRow];
+            edge.targetDescriptor = &facts.descriptors[source.targetDescriptorRow];
+            edge.id = source.id;
+            edge.associationExact = source.associationExact;
+            edge.spawnerRow = source.spawnerRow;
+            edge.sourceDescriptorRow = source.sourceDescriptorRow;
+            for (std::uint32_t contextRow = source.scenarioContexts.first;
+                 contextRow < source.scenarioContexts.first + source.scenarioContexts.count;
+                 ++contextRow) {
+                const GraphEdgeContext& context = graph.edgeContexts[contextRow];
+                if (context.edgeRow != graphEdgeRow
+                    || context.scenarioIndex >= topology.scenarios.size()) {
+                    return false;
+                }
+                edge.scenarios.push_back(context.scenarioIndex);
+            }
+            edge.geometryScenarios = edge.scenarios;
+            edges.push_back(std::move(edge));
+        }
+
+        // A rule whose points lie outside the scenario's object lists gives the graph no edge
+        // context. Such an edge is joined per occurrence, and only those occurrences gain a squad.
+        const OccurrenceRuleIndex occurrenceRules(topology, facts);
+        using EdgeKey = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
+        std::map<EdgeKey, std::size_t> edgesByBinding{};
+        for (std::size_t row = 0; row < graph.edges.size(); ++row) {
+            const auto& edge = graph.edges[row];
+            edgesByBinding.emplace(EdgeKey{edge.spawnerRow,
+                                           edge.sourceDescriptorRow,
+                                           edge.ruleRow,
+                                           edge.targetDescriptorRow},
+                                   row);
+        }
+        for (const auto& context : facts.configOccurrences) {
+            const auto spawnerRow = occurrenceRules.spawner(context.configTag);
+            if (spawnerRow == format::kAbsentIndex) {
+                continue;
+            }
+            for (const auto sourceRow : occurrenceRules.sources(context.configTag)) {
+                const auto proof =
+                    occurrenceRules.resolve(spawnerRow, sourceRow, context.occurrenceIndex);
+                if (!proof.exact()) {
+                    continue;
+                }
+                const EdgeKey key{spawnerRow, sourceRow, proof.ruleRow, proof.descriptorRow};
+                auto found = edgesByBinding.find(key);
+                if (found == edgesByBinding.end()) {
+                    Edge edge{};
+                    edge.spawnerRow = spawnerRow;
+                    edge.sourceDescriptorRow = sourceRow;
+                    edge.spawner = &facts.spawners[spawnerRow];
+                    edge.rule = &facts.rules[proof.ruleRow];
+                    edge.sourceDescriptor = &facts.descriptors[sourceRow];
+                    edge.targetDescriptor = &facts.descriptors[proof.descriptorRow];
+                    std::string objectId{}, digest{};
+                    std::string_view slotId{};
+                    if (!format_text(
+                            objectId,
+                            "object/%08x",
+                            static_cast<unsigned>(
+                                topology.objects[edge.targetDescriptor->objectIndex].objectTag))
+                        || !text_view(topology.slots[edge.targetDescriptor->slotIndex].id,
+                                      slotId)) {
+                        return false;
+                    }
+                    const std::array<std::string_view, 5> parts{graph.spawners[spawnerRow].id,
+                                                                edge.sourceDescriptor->id,
+                                                                graph.rules[proof.ruleRow].id,
+                                                                objectId,
+                                                                slotId};
+                    if (!domain_hash(squadIdHasher,
+                                     "sunrise-authored-spawner-rule-edge-v1",
+                                     parts,
+                                     digest)) {
+                        return false;
+                    }
+                    edge.id = "authored-spawner-rule-edge/" + digest;
+                    const auto row = edges.size();
+                    edges.push_back(std::move(edge));
+                    found = edgesByBinding.emplace(key, row).first;
+                }
+                auto& edge = edges[found->second];
+                edge.provedOccurrences.push_back(context.occurrenceIndex);
+                const auto scenario = topology.occurrences[context.occurrenceIndex].scenarioIndex;
+                if (std::find(edge.scenarios.begin(), edge.scenarios.end(), scenario)
+                    == edge.scenarios.end()) {
+                    edge.scenarios.push_back(scenario);
+                }
+            }
+        }
+
+        if (edges.size() >= format::kAbsentIndex) {
+            return false;
+        }
+        const std::uint32_t authoredSpawnerRuleEdgeCount = static_cast<std::uint32_t>(edges.size());
+        std::vector<PendingSquad> pending{};
+        bool actorLinksComplete = true;
+        for (const Edge& edge : edges) {
+            if (edge.sourceDescriptor->objectIndex != edge.targetDescriptor->objectIndex) {
+                continue;
+            }
+            for (const std::uint32_t scenarioIndex : edge.scenarios) {
+                const auto sourceOccurrences = occurrencesByConfigObjectScenario.find(
+                    {edge.spawner->configTag, edge.sourceDescriptor->objectIndex, scenarioIndex});
+                if (sourceOccurrences == occurrencesByConfigObjectScenario.end()) {
+                    continue;
+                }
+                const std::vector<std::uint32_t>& occurrenceIndexes = sourceOccurrences->second;
+                for (const std::uint32_t occurrenceIndex : occurrenceIndexes) {
+                    const topology::Occurrence& occurrence = topology.occurrences[occurrenceIndex];
+                    const bool hasOccurrenceProof = std::find(edge.provedOccurrences.begin(),
+                                                              edge.provedOccurrences.end(),
+                                                              occurrenceIndex)
+                                                    != edge.provedOccurrences.end();
+                    const auto proof = hasOccurrenceProof
+                                           ? occurrenceRules.resolve(edge.spawnerRow,
+                                                                     edge.sourceDescriptorRow,
+                                                                     occurrenceIndex)
+                                           : OccurrenceRule{};
+                    const bool occurrenceExact =
+                        proof.exact() && &facts.rules[proof.ruleRow] == edge.rule
+                        && &facts.descriptors[proof.descriptorRow] == edge.targetDescriptor;
+                    const bool geometryScenario = std::find(edge.geometryScenarios.begin(),
+                                                            edge.geometryScenarios.end(),
+                                                            scenarioIndex)
+                                                  != edge.geometryScenarios.end();
+                    if (!geometryScenario && !occurrenceExact) {
+                        continue;
+                    }
+                    std::string_view occurrenceId{};
+                    if (!text_view(occurrence.id, occurrenceId)) {
+                        return false;
+                    }
+                    std::string squadDigest{};
+                    const std::array<std::string_view, 2> parts{edge.id, occurrenceId};
+                    if (!domain_hash(
+                            squadIdHasher, "sunrise-runtime-squad-v1", parts, squadDigest)) {
+                        return false;
+                    }
+                    PendingSquad squad{};
+                    squad.row.id = "squad/" + squadDigest;
+                    squad.row.scenarioIndex = scenarioIndex;
+                    squad.row.objectIndex = edge.sourceDescriptor->objectIndex;
+                    squad.row.slotIndex = edge.sourceDescriptor->slotIndex;
+                    squad.row.spawnerConfigTag = edge.spawner->configTag;
+                    squad.row.spawnRuleConfigTag = edge.rule->configTag;
+                    squad.row.occurrenceIndex = occurrenceIndex;
+
+                    bool sourceExact = false;
+                    const auto schema = schemasBySlot.find(edge.sourceDescriptor->slotIndex);
+                    if (schema != schemasBySlot.end() && schema->second->exact) {
+                        const GraphSlotSchemaProvenance& slotSchema = *schema->second;
+                        sourceExact =
+                            topology.slots[edge.sourceDescriptor->slotIndex].objectIndex
+                                == edge.sourceDescriptor->objectIndex
+                            && topology.slots[edge.sourceDescriptor->slotIndex].slotType
+                                   == format::kSquadSlotType
+                            && slotSchema.componentClass == generated::SSquadComponent::kClass
+                            && slotSchema.senseSchema == generated::C80807ecc::kClass
+                            && slotSchema.authSchema == generated::C80807ec9::kClass;
+                    }
+                    if (sourceExact) {
+                        squad.row.flags |= format::kSquadSourceDescriptorExact;
+                    }
+                    if (edge.associationExact || occurrenceExact) {
+                        squad.row.flags |= format::kSquadSpawnerRuleEdgeExact;
+                    }
+                    squad.row.flags |= format::kSquadScenarioOccurrenceExact;
+                    if (sourceExact && occurrenceExact) {
+                        squad.row.flags |= format::kSquadOccurrenceRuleExact;
+                    }
+
+                    squad.members.reserve(edge.spawner->members.size());
+                    for (std::uint32_t memberOrdinal = 0;
+                         memberOrdinal < edge.spawner->members.size();
+                         ++memberOrdinal) {
+                        SquadMember member{};
+                        if (!detail::build_member(edge.spawner->members[memberOrdinal],
+                                                  squadDigest,
+                                                  memberOrdinal,
+                                                  actorResolver,
+                                                  actorContext,
+                                                  member,
+                                                  actorLinksComplete)) {
+                            return false;
+                        }
+                        squad.members.push_back(std::move(member));
+                    }
+
+                    const auto ruleContextCount =
+                        configOccurrenceCounts.find({edge.rule->configTag, occurrenceIndex});
+                    const std::size_t exactRuleContextCount =
+                        ruleContextCount == configOccurrenceCounts.end() ? 0
+                                                                         : ruleContextCount->second;
+                    std::vector<SquadAnchor> exactAnchors{};
+                    if (edge.rule->inlineForm && exactRuleContextCount == 1
+                        && edge.rule->points.size() == 1) {
+                        // The one inline point names the spawner's own placement.
+                        const CandidateFact& placement = edge.spawner->inlinePlacement;
+                        const RulePointFact& point = edge.rule->points.front();
+                        if (placement.state == CandidateState::exactPlacement
+                            && placement.placedEntryIdentity == point.placedEntryIdentity
+                            && placement.placedEntryIdentity != 0
+                            && placement.placedEntryIdentity
+                                   != (std::numeric_limits<std::uint64_t>::max)()) {
+                            SquadAnchor anchor{};
+                            if (!format_text(anchor.id,
+                                             "squad-anchor/%.*s/%06x",
+                                             static_cast<int>(squadDigest.size()),
+                                             squadDigest.data(),
+                                             0U)) {
+                                return false;
+                            }
+                            anchor.pointOrdinal = 0;
+                            anchor.objectListTag = 0;
+                            anchor.placementOrdinal = 0;
+                            anchor.flags = format::kSquadAnchorExact | format::kSquadAnchorInline;
+                            anchor.placedEntryIdentity = placement.placedEntryIdentity;
+                            anchor.positionBits = placement.positionBits;
+                            exactAnchors.push_back(std::move(anchor));
+                        }
+                    } else if (!edge.rule->inlineForm && exactRuleContextCount == 1
+                               && !edge.rule->points.empty()) {
+                        exactAnchors.reserve(edge.rule->points.size());
+                        for (std::uint32_t pointOrdinal = 0;
+                             pointOrdinal < edge.rule->points.size();
+                             ++pointOrdinal) {
+                            const RulePointFact& point = edge.rule->points[pointOrdinal];
+                            const auto matches = placementsByIdentity.find(
+                                {scenarioIndex, point.placedEntryIdentity});
+                            if (matches == placementsByIdentity.end()
+                                || matches->second.size() != 1) {
+                                exactAnchors.clear();
+                                break;
+                            }
+                            const GraphPlacementContext& placement = *matches->second.front();
+                            // An external row is not owned by this occurrence, and a
+                            // descriptor-embedded one names no object list. The client resolves
+                            // either by scanning the objects the scenario loads.
+                            const bool ownedHere =
+                                placement.external
+                                || (placement.occurrenceIndex == occurrenceIndex
+                                    && placement.objectListTag != 0
+                                    && placement.objectListTag != format::kAbsentIndex);
+                            if (!ownedHere || placement.placedEntryIdentity == 0
+                                || placement.placedEntryIdentity
+                                       == (std::numeric_limits<std::uint64_t>::max)()) {
+                                exactAnchors.clear();
+                                break;
+                            }
+                            SquadAnchor anchor{};
+                            if (!format_text(anchor.id,
+                                             "squad-anchor/%.*s/%06x",
+                                             static_cast<int>(squadDigest.size()),
+                                             squadDigest.data(),
+                                             static_cast<unsigned>(pointOrdinal))) {
+                                return false;
+                            }
+                            anchor.pointOrdinal = pointOrdinal;
+                            anchor.objectListTag = placement.objectListTag;
+                            anchor.placementOrdinal = placement.placementOrdinal;
+                            anchor.flags =
+                                format::kSquadAnchorExact
+                                | (placement.external ? format::kSquadAnchorExternal : 0U);
+                            anchor.placedEntryIdentity = placement.placedEntryIdentity;
+                            anchor.positionBits = placement.positionBits;
+                            exactAnchors.push_back(std::move(anchor));
+                        }
+                    }
+                    if (exactAnchors.size() == edge.rule->points.size()
+                        && !edge.rule->points.empty()) {
+                        squad.anchors = std::move(exactAnchors);
+                        squad.row.flags |= format::kSquadAllPointsExact;
+                    }
+
+                    const bool memberCountValid =
+                        squad.members.size() >= format::kSquadMinimumMemberCount
+                        && squad.members.size() <= format::kSquadMaximumMemberCount;
+                    if (memberCountValid) {
+                        squad.row.flags |= format::kSquadMemberCountValid;
+                    }
+                    const bool invariantComplete =
+                        memberCountValid
+                        && std::all_of(squad.members.begin(),
+                                       squad.members.end(),
+                                       [](const SquadMember& member) {
+                                           return (member.flags
+                                                   & format::kSquadMemberInvariantReadyMask)
+                                                      == format::kSquadMemberInvariantReadyMask
+                                                  && member.defaultCount > 0;
+                                       });
+                    if (invariantComplete) {
+                        squad.row.flags |= format::kSquadCandidateCountsInvariantComplete;
+                    }
+                    std::vector<std::uint32_t> memberKeys{};
+                    memberKeys.reserve(squad.members.size());
+                    for (const SquadMember& member : squad.members) {
+                        memberKeys.push_back(member.memberKey);
+                    }
+                    std::sort(memberKeys.begin(), memberKeys.end());
+                    if (std::adjacent_find(memberKeys.begin(), memberKeys.end())
+                        != memberKeys.end()) {
+                        return false;
+                    }
+                    std::vector<std::uint64_t> anchorIdentities{};
+                    anchorIdentities.reserve(squad.anchors.size());
+                    for (const SquadAnchor& anchor : squad.anchors) {
+                        anchorIdentities.push_back(anchor.placedEntryIdentity);
+                    }
+                    std::sort(anchorIdentities.begin(), anchorIdentities.end());
+                    if (std::adjacent_find(anchorIdentities.begin(), anchorIdentities.end())
+                        != anchorIdentities.end()) {
+                        return false;
+                    }
+                    pending.push_back(std::move(squad));
+                }
+            }
+        }
+
+        if (!project_unbound_squads(
+                topology, facts, graph, squadIdHasher, actorResolver, actorContext, pending)) {
+            return false;
+        }
+
+        std::sort(pending.begin(),
+                  pending.end(),
+                  [](const PendingSquad& first, const PendingSquad& second) {
+                      const auto firstNatural = squad_natural(first);
+                      const auto secondNatural = squad_natural(second);
+                      return firstNatural != secondNatural ? firstNatural < secondNatural
+                                                           : first.row.id < second.row.id;
+                  });
+        for (std::size_t index = 1; index < pending.size(); ++index) {
+            if (squad_natural(pending[index - 1]) == squad_natural(pending[index])) {
+                return false;
+            }
+        }
+        if (pending.size() >= format::kAbsentIndex) {
+            return false;
+        }
+        Snapshot linked{};
+        linked.squads.reserve(pending.size());
+        for (std::uint32_t squadIndex = 0; squadIndex < pending.size(); ++squadIndex) {
+            PendingSquad& source = pending[squadIndex];
+            if (linked.members.size() >= format::kAbsentIndex
+                || linked.anchors.size() >= format::kAbsentIndex
+                || source.members.size() > format::kAbsentIndex - linked.members.size()
+                || source.anchors.size() > format::kAbsentIndex - linked.anchors.size()) {
+                return false;
+            }
+            source.row.members = {static_cast<std::uint32_t>(linked.members.size()),
+                                  static_cast<std::uint32_t>(source.members.size())};
+            for (SquadMember& member : source.members) {
+                member.squadIndex = squadIndex;
+                linked.members.push_back(std::move(member));
+            }
+            source.row.anchors = {static_cast<std::uint32_t>(linked.anchors.size()),
+                                  static_cast<std::uint32_t>(source.anchors.size())};
+            for (SquadAnchor& anchor : source.anchors) {
+                anchor.squadIndex = squadIndex;
+                linked.anchors.push_back(std::move(anchor));
+            }
+            linked.squads.push_back(std::move(source.row));
+        }
+        linked.authoredSpawnerRuleEdgeCount = authoredSpawnerRuleEdgeCount;
+        linked.actorLinksComplete = actorLinksComplete;
+        linked.ready = true;
+        output = std::move(linked);
+        return true;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+} // namespace sunrise::client::content::activity::sdk_generation::squad_inventory

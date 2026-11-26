@@ -1,0 +1,924 @@
+#include <Windows.h>
+
+#include <algorithm>
+#include <array>
+#include <string_view>
+#include <vector>
+
+#include "../../../../../middleware/bap/activity_message/darkness_zone_auth.h"
+#include "../../../../../middleware/bap/activity_message/ghost_link_sense.h"
+#include "../../../../../middleware/content/packages/tables/region_reader.h"
+#include "../../../../../state/activity/bubble_authority/runtime.h"
+#include "../../../../../state/activity/defaults/activity_defaults_snapshot.h"
+#include "../../../../../state/activity/destination/activity_destination_spawn_binding.h"
+#include "../../../../../state/activity/membership/activity_membership_query.h"
+#include "../../../../../state/activity/mission/runtime.h"
+#include "../../../../../state/activity/runtime.h"
+#include "../../../../../state/activity_sdk/runtime.h"
+#include "../../../../../state/build_data/runtime.h"
+#include "../../../../../state/runtime/runtime.h"
+#include "../../../../activity/activity_sdk_squad_runtime.h"
+#include "../../../../gameplay/gameplay_advertisement.h"
+#include "../../../../gameplay/group/group_host_sessions.h"
+#include "../../../activity_mission_seed_lease.h"
+#include "activity_arrival.h"
+#include "activity_member_roster.h"
+#include "activity_mission_seed_roster.h"
+#include "internal.h"
+
+namespace sunrise::server::bap::encrypted::push::activity {
+
+namespace layouts = state::build_data::scenarios;
+namespace squad = middleware::bap::activity_message::squad_auth;
+
+namespace {
+
+/** @return True when the published roster declares a Sense schema for this exact slot. */
+[[nodiscard]] bool declares_sense_slot(const message::Roster& roster,
+                                       const message::AuthOverride& value) noexcept {
+    for (std::size_t index = 0; index < roster.groupCount; ++index) {
+        const message::Group& group = roster.groups[index];
+        if (group.key != value.key || group.objectTag != value.objectTag) {
+            continue;
+        }
+        for (std::size_t slot = 0; slot < group.slotTypes.size(); ++slot) {
+            if (group.slotTypes[slot] == value.slotType
+                && group.slotIndices[slot] == value.slotIndex
+                && (group.slotFlags[slot] & message::kSlotSenseFlag) != 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * @return The generation a link's retained squad bodies are authorized for: the owner's on a
+ * public link that publishes its private link's mission, else the link's own.
+ */
+[[nodiscard]] std::uint64_t squad_lease_generation(const Session& session) noexcept {
+    const Session* const owner = public_mission_owner_locked(session);
+    return owner != nullptr ? owner->activity.bindingGeneration
+                            : session.activity.bindingGeneration;
+}
+
+/**
+ * Starts a public link's publication over when its owner's activity changes. Like a new link, it
+ * owes no dialogue line said before it.
+ */
+void begin_owner_publication(Session& link, const Session& owner) noexcept {
+    PublicOwnerPublication& publication = link.activityPublicOwner;
+    if (state::activity::same_binding(publication.binding, owner.activity.session)) {
+        return;
+    }
+    publication = {};
+    publication.binding = owner.activity.session;
+    server::activity::host::AuthState ownerState{};
+    if (server::activity::host::auth_state(
+            owner.activity.session, owner.activity.bindingGeneration, ownerState)) {
+        publication.dialogueRevision = ownerState.dialogueRevision;
+    }
+}
+
+} // namespace
+
+/** Merges one staged squad body after the complete cumulative frame reached transport output. */
+bool activate_staged_squad_override(Session& session) noexcept {
+    const RosterPublication& staged = session.activityRosterStaged;
+    const server::activity::host::PendingScriptableOverride& pending = staged.scriptableOverride;
+    const server::activity::host::ScriptableTarget& target = pending.target;
+    const std::uint64_t leaseGeneration =
+        staged.ownerScriptable ? staged.ownerGeneration : staged.bindingGeneration;
+    if (!staged.staged || !staged.hasScriptableOverride || !staged.activatesSquadOverride
+        || staged.bindingGeneration == 0
+        || staged.bindingGeneration != session.activity.bindingGeneration
+        || leaseGeneration != squad_lease_generation(session)
+        || pending.expectedActivityClientGeneration != leaseGeneration
+        || pending.kind != server::activity::host::ScriptableOverrideKind::squad
+        || (target.stateLocalRoster && !staged.hasSquadStateSequence)) {
+        return false;
+    }
+    RetainedSquadAuth retained{};
+    if (!make_retained_squad_auth(pending, leaseGeneration, retained)) {
+        return false;
+    }
+    if (target.stateLocalRoster) {
+        const layouts::RosterGroup& group = pending.stateLocalRosterGroup;
+        if (staged.stateLocalRegion != target.stateLocalRegion
+            || !layouts::valid_roster_group(group)
+            || target.rosterGroupIndex != server::activity::host::kGeneratedRosterGroupIndex
+            || target.sdkObjectIndex == server::activity::host::kNoSdkObjectIndex
+            || group.objectTag != target.objectTag || group.registryKey != target.registryKey
+            || target.rosterSlotOffset >= group.slotCount
+            || group.slotTypes[target.rosterSlotOffset] != target.slotType
+            || group.slotIndices[target.rosterSlotOffset] != target.slotIndex
+            || (group.slotFlags[target.rosterSlotOffset] & message::kSlotAuthFlag) == 0) {
+            return false;
+        }
+    } else if (target.stateLocalRegion >= 0) {
+        return false;
+    }
+
+    SquadOverrideLease& lease = session.activitySquadOverride;
+    if (!lease.active) {
+        SecureZeroMemory(&lease, sizeof lease);
+        lease.groups[0].scopeTarget = target;
+        if (target.stateLocalRoster) {
+            lease.groups[0].stateLocalRosterGroup = pending.stateLocalRosterGroup;
+        }
+        lease.groups[0].region = target.stateLocalRegion;
+        lease.groups[0].authCount = 1;
+        lease.groups[0].stateSequence = staged.squadStateSequence;
+        lease.groups[0].regionEpoch = session.activityRosterRegionEpoch;
+        retained.groupIndex = 0;
+        lease.authBodies[0] = retained;
+        lease.bindingGeneration = leaseGeneration;
+        lease.authCount = 1;
+        lease.groupCount = 1;
+        lease.active = true;
+        return true;
+    }
+    if (!valid_retained_squad_lease(lease, leaseGeneration)) {
+        return false;
+    }
+    const std::size_t groupIndex = retained_group_index(lease, target);
+    if (groupIndex < lease.groupCount) {
+        RetainedSquadGroup& group = lease.groups[groupIndex];
+        if (target.stateLocalRoster
+            && (!same_generated_group(group.stateLocalRosterGroup, pending.stateLocalRosterGroup)
+                || staged.squadStateSequence != group.stateSequence)) {
+            return false;
+        }
+        retained.groupIndex = static_cast<std::uint8_t>(groupIndex);
+        for (std::size_t index = 0; index < lease.authCount; ++index) {
+            if (lease.authBodies[index].groupIndex != groupIndex
+                || !same_retained_target(group, lease.authBodies[index], target)) {
+                continue;
+            }
+            lease.authBodies[index] = retained;
+            return true;
+        }
+        if (lease.authCount >= lease.authBodies.size()
+            || (target.stateLocalRoster
+                && group.authCount >= group.stateLocalRosterGroup.slotCount)) {
+            return false;
+        }
+        lease.authBodies[lease.authCount] = retained;
+        ++lease.authCount;
+        ++group.authCount;
+        return true;
+    }
+    if (lease.groupCount >= lease.groups.size() || lease.authCount >= lease.authBodies.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < lease.groupCount; ++index) {
+        if (lease.groups[index].scopeTarget.registryKey == target.registryKey) {
+            return false;
+        }
+    }
+    RetainedSquadGroup& group = lease.groups[lease.groupCount];
+    group = {};
+    group.scopeTarget = target;
+    if (target.stateLocalRoster) {
+        group.stateLocalRosterGroup = pending.stateLocalRosterGroup;
+    }
+    group.region = target.stateLocalRegion;
+    group.authCount = 1;
+    group.stateSequence = staged.squadStateSequence;
+    group.regionEpoch = session.activityRosterRegionEpoch;
+    retained.groupIndex = static_cast<std::uint8_t>(lease.groupCount);
+    lease.authBodies[lease.authCount] = retained;
+    ++lease.authCount;
+    ++lease.groupCount;
+    return true;
+}
+
+/** Restores counters from one discarded publication while leaving its committed lease intact. */
+void rollback_staged_roster_state(Session& session) noexcept {
+    const RosterPublication& staged = session.activityRosterStaged;
+    if (!staged.staged) {
+        return;
+    }
+    session.activityRosterGroupLeases = staged.priorLeases;
+    session.activityRosterSends = staged.priorSends;
+    session.activityRosterState = staged.priorState;
+    session.activityRosterRegionEpoch = staged.priorRegionEpoch;
+    session.activityRosterRegionBubble = staged.priorRegionBubble;
+    session.activityRosterOwedForEpoch = staged.priorRosterOwedForEpoch;
+    session.activityRosterStaged = {};
+}
+
+/** Builds the roster body input for one session's current destination. */
+RosterOutcome
+build_roster_snapshot(Session& session,
+                      Scratch& scratch,
+                      message::Snapshot& snapshot,
+                      std::span<char> destination,
+                      std::size_t& destinationLength,
+                      const middleware::bap::activity_message::patch_epoch::PatchEpoch* epoch,
+                      std::uint8_t lifetimeState,
+                      const message::ActivityFlags& activityFlags,
+                      const message::AuthOverride* authOverride,
+                      std::uint16_t rosterGroupIndex,
+                      std::uint16_t rosterSlotOffset,
+                      bool stateLocalRosterTarget,
+                      std::int32_t stateLocalRegion,
+                      std::uint32_t sdkObjectIndex,
+                      const layouts::RosterGroup* stateLocalRosterGroup,
+                      const EffectiveRegion* exactRegion,
+                      const RefreshReport* refresh,
+                      std::span<const TailAuthOverride> tailOverrides) noexcept {
+    snapshot = {};
+    destinationLength = 0;
+    state::activity::defaults::ActivityDefaults defaults{};
+    state::activity::defaults::snapshot(defaults);
+    if (session.activity.role == ActivityClientRole::none
+        || !state::activity::binding_matches(session.activity.session)
+        || !state::activity::binding_matches(session.activity.source)) {
+        return RosterOutcome::noLayout;
+    }
+    // Public targets keep the destination copied from their exact advertised source generation.
+    const state::activity::destination::DestinationSelection& selection =
+        session.activity.session.destination;
+    layouts::Definition layout{};
+    const std::string_view name(reinterpret_cast<const char*>(selection.packageName.data()),
+                                selection.packageNameLength);
+    destinationLength = (std::min)(name.size(), destination.size());
+    std::copy_n(name.begin(), destinationLength, destination.begin());
+    if (!state::build_data::find_scenario_layout(name, layout)) {
+        return RosterOutcome::noLayout;
+    }
+    const std::uint64_t hostedBubbles = hosted_bubble_mask(session);
+    if (!fill_roster(
+            layout, hostedBubbles, publishes_top_level_groups(session), scratch, snapshot.roster)) {
+        return RosterOutcome::noGroups;
+    }
+    // A public link publishes the content its private link's mission places in a bubble the
+    // mission's world authors public and this link hosts.
+    const Session* const owner = public_mission_owner_locked(session);
+    const std::uint64_t ownerBubbles = owner != nullptr ? owner_public_bubbles(session, *owner) : 0;
+    layouts::Definition ownerLayout{};
+    if (owner != nullptr) {
+        begin_owner_publication(session, *owner);
+        static_cast<void>(session_scenario_layout(*owner, ownerLayout));
+    }
+
+    const state::activity::defaults::FallbackPolicy& fallback =
+        defaults.defaultDestination.fallback;
+    // One resolution serves this body and the citizen advertisement in message 12. Two would let
+    // the join descriptor land in a region record the client is not pending on.
+    std::uint16_t arrival{};
+    if (!session_arrival_slice_set(
+            session.activity.session,
+            layout,
+            arrival_slice_set(defaults.defaultDestination,
+                              selection,
+                              name,
+                              layout,
+                              state::activity::membership::declared_initial_region(
+                                  session.activity.session.sessionId)),
+            arrival)) {
+        return RosterOutcome::noLayout;
+    }
+    const EffectiveRegion committedRegion = selected_effective_region(session, arrival);
+    const EffectiveRegion region = exactRegion == nullptr ? committedRegion : *exactRegion;
+    if (exactRegion != nullptr
+        && (session.activity.role != ActivityClientRole::privateCurrent || !region.reported
+            || region.arrival != committedRegion.arrival)) {
+        return refuse_override("exact_region");
+    }
+    if (region.index < 0) {
+        return RosterOutcome::noLayout;
+    }
+    std::vector<server::activity::host::PendingScriptableOverride> authEstate{};
+    if (!server::activity::host::scriptable_auth_estate(
+            session.activity.session, session.activity.bindingGeneration, authEstate)) {
+        return refuse_override("auth_estate");
+    }
+    const std::size_t canonicalGroupCount = snapshot.roster.groupCount;
+    if (append_initial_mission_seed(session,
+                                    scratch,
+                                    snapshot,
+                                    static_cast<std::uint32_t>(region.index),
+                                    hostedBubbles,
+                                    canonicalGroupCount,
+                                    refresh)
+        == MissionSeedRosterResult::refused) {
+        return refuse_override("mission_seed");
+    }
+    if (ownerBubbles != 0) {
+        if (append_owner_mission_seed(session, *owner, scratch, snapshot, ownerBubbles)
+            == MissionSeedRosterResult::refused) {
+            return refuse_override("owner_mission_seed");
+        }
+        if (!append_owner_layout_groups(*owner, ownerBubbles, scratch, snapshot.roster)) {
+            return refuse_override("owner_layout_groups");
+        }
+    }
+    // Retained and pending groups below may only match a group the seed published.
+    const std::size_t seedGroupCount = snapshot.roster.groupCount;
+    const bool pendingStateLocal = authOverride != nullptr && stateLocalRosterTarget;
+    const std::uint64_t leaseGeneration = squad_lease_generation(session);
+    if (session.activitySquadOverride.active
+        && session.activitySquadOverride.bindingGeneration != leaseGeneration) {
+        SecureZeroMemory(&session.activitySquadOverride, sizeof session.activitySquadOverride);
+    }
+    const bool retainedSquad = session.activitySquadOverride.active;
+    const SquadOverrideLease& lease = session.activitySquadOverride;
+    if (retainedSquad && !valid_retained_squad_lease(lease, leaseGeneration)) {
+        return refuse_override("retained_lease");
+    }
+    server::activity::host::ScriptableTarget pendingTarget{};
+    if (authOverride != nullptr) {
+        pendingTarget.objectTag = authOverride->objectTag;
+        pendingTarget.registryKey = authOverride->key;
+        pendingTarget.authSchema = authOverride->authSchema;
+        pendingTarget.rosterGroupIndex = rosterGroupIndex;
+        pendingTarget.rosterSlotOffset = rosterSlotOffset;
+        pendingTarget.slotIndex = authOverride->slotIndex;
+        pendingTarget.sdkObjectIndex = sdkObjectIndex;
+        pendingTarget.stateLocalRegion = stateLocalRegion;
+        pendingTarget.slotType = authOverride->slotType;
+        pendingTarget.stateLocalRoster = stateLocalRosterTarget;
+    }
+    const bool squadOverride = authOverride != nullptr && authOverride->slotType == squad::kSlotType
+                               && authOverride->authSchema == squad::kSchema;
+    const std::size_t pendingGroupIndex = retainedSquad && authOverride != nullptr
+                                              ? retained_group_index(lease, pendingTarget)
+                                              : lease.groupCount;
+    if (retainedSquad && authOverride != nullptr) {
+        if (pendingGroupIndex < lease.groupCount) {
+            const RetainedSquadGroup& retainedGroup = lease.groups[pendingGroupIndex];
+            if (stateLocalRosterTarget
+                && (stateLocalRosterGroup == nullptr
+                    || !same_generated_group(*stateLocalRosterGroup,
+                                             retainedGroup.stateLocalRosterGroup))) {
+                return refuse_override("retained_group_mismatch");
+            }
+        } else if (squadOverride
+                   && (lease.groupCount >= lease.groups.size()
+                       || lease.authCount >= lease.authBodies.size())) {
+            return refuse_override("lease_capacity");
+        }
+    }
+    if (pendingStateLocal
+        && (stateLocalRosterGroup == nullptr
+            || rosterGroupIndex != server::activity::host::kGeneratedRosterGroupIndex
+            || sdkObjectIndex == server::activity::host::kNoSdkObjectIndex)) {
+        return refuse_override("pending_state_local_target");
+    }
+    std::array<std::size_t, message::kPublishedGroupCapacity> retainedGroupPositions{};
+    retainedGroupPositions.fill(snapshot.roster.groups.size());
+    // A group the private link's public link publishes is left out here with its bodies.
+    std::array<bool, message::kPublishedGroupCapacity> retainedElsewhere{};
+    for (std::size_t index = 0; retainedSquad && index < lease.groupCount; ++index) {
+        const RetainedSquadGroup& retainedGroup = lease.groups[index];
+        if (!retainedGroup.scopeTarget.stateLocalRoster) {
+            continue;
+        }
+        if (session.activity.role == ActivityClientRole::privateCurrent
+            && publishes_on_public(session, retainedGroup.scopeTarget)) {
+            retainedElsewhere[index] = true;
+            continue;
+        }
+        if (owner != nullptr && !note_owner_key(scratch, retainedGroup.scopeTarget.registryKey)) {
+            return refuse_override("owner_key_capacity");
+        }
+        // An owner's group names a region of the owner's world.
+        if (!msg1_selects_region(owner != nullptr ? ownerLayout : layout, retainedGroup.region)) {
+            return refuse_override("retained_region");
+        }
+        const std::uint32_t bubble = static_cast<std::uint32_t>(retainedGroup.region)
+                                     / middleware::content::packages::tables::kSliceSetIndexFactor;
+        std::size_t position = snapshot.roster.groups.size();
+        const ExistingGroup existing = find_existing_group(
+            retainedGroup.stateLocalRosterGroup, scratch, snapshot.roster, position);
+        if (existing == ExistingGroup::conflict
+            || (existing == ExistingGroup::exact && position >= seedGroupCount)
+            || (existing == ExistingGroup::exact
+                && !activate_existing_group(position, bubble, scratch, snapshot.roster))) {
+            return refuse_override("retained_existing_group");
+        }
+        if (existing == ExistingGroup::missing) {
+            position = snapshot.roster.groupCount;
+            if (!append_state_local_group(
+                    retainedGroup.stateLocalRosterGroup, bubble, scratch, snapshot.roster)) {
+                return refuse_override("retained_append");
+            }
+        }
+        retainedGroupPositions[index] = position;
+    }
+    const bool pendingAddsGroup = pendingStateLocal && pendingGroupIndex == lease.groupCount;
+    std::size_t pendingGroupPosition = snapshot.roster.groups.size();
+    if (!pendingAddsGroup && pendingStateLocal && pendingGroupIndex < lease.groupCount) {
+        pendingGroupPosition = retainedGroupPositions[pendingGroupIndex];
+    }
+    for (std::size_t index = 0; retainedSquad && index < lease.authCount; ++index) {
+        message::AuthOverride retainedAuth{};
+        if (!retained_squad_auth(lease, index, retainedAuth)) {
+            return refuse_override("retained_auth");
+        }
+        const RetainedSquadAuth& retained = lease.authBodies[index];
+        if (retainedElsewhere[retained.groupIndex]) {
+            continue;
+        }
+        const RetainedSquadGroup& retainedGroup = lease.groups[retained.groupIndex];
+        const bool replace =
+            authOverride != nullptr && same_retained_target(retainedGroup, retained, pendingTarget);
+        const message::AuthOverride& effectiveAuth = replace ? *authOverride : retainedAuth;
+        const std::uint16_t effectiveGroup =
+            replace ? rosterGroupIndex : retainedGroup.scopeTarget.rosterGroupIndex;
+        const std::uint16_t effectiveSlot = replace ? rosterSlotOffset : retained.rosterSlotOffset;
+        const bool effectiveStateLocal =
+            replace ? stateLocalRosterTarget : retainedGroup.scopeTarget.stateLocalRoster;
+        if (!install_auth_override(layout,
+                                   region,
+                                   scratch,
+                                   snapshot,
+                                   effectiveAuth,
+                                   effectiveGroup,
+                                   effectiveSlot,
+                                   effectiveStateLocal)) {
+            return refuse_override("retained_auth_install");
+        }
+    }
+    if (const char* refusal = append_retained_auth_estate(session,
+                                                          nullptr,
+                                                          0,
+                                                          layout,
+                                                          region,
+                                                          scratch,
+                                                          snapshot,
+                                                          authEstate,
+                                                          session.activityDialogueRevision)) {
+        return refuse_override(refusal);
+    }
+    if (ownerBubbles != 0) {
+        std::vector<server::activity::host::PendingScriptableOverride> ownerEstate{};
+        if (!server::activity::host::scriptable_auth_estate(
+                owner->activity.session, owner->activity.bindingGeneration, ownerEstate)) {
+            return refuse_override("owner_auth_estate");
+        }
+        if (const char* refusal =
+                append_retained_auth_estate(session,
+                                            owner,
+                                            ownerBubbles,
+                                            layout,
+                                            region,
+                                            scratch,
+                                            snapshot,
+                                            ownerEstate,
+                                            session.activityPublicOwner.dialogueRevision)) {
+            return refuse_override(refusal);
+        }
+    }
+    // The pending override's group goes after the retained estate, where the next push will place
+    // it once retained, so two pushes carry the same group order. An exact match here may be a
+    // group the estate just appended, so no position bound applies.
+    if (pendingAddsGroup) {
+        const std::uint32_t bubble = static_cast<std::uint32_t>(stateLocalRegion)
+                                     / middleware::content::packages::tables::kSliceSetIndexFactor;
+        ExistingGroup existing = ExistingGroup::conflict;
+        if (stateLocalRosterGroup != nullptr) {
+            existing = find_existing_group(
+                *stateLocalRosterGroup, scratch, snapshot.roster, pendingGroupPosition);
+        }
+        if (existing == ExistingGroup::conflict && owner_key(scratch, pendingTarget.registryKey)) {
+            report_owner_key_conflict(owner, pendingTarget);
+        }
+        if (existing == ExistingGroup::conflict
+            || (existing == ExistingGroup::exact
+                && !activate_existing_group(
+                    pendingGroupPosition, bubble, scratch, snapshot.roster))) {
+            return refuse_override("pending_existing_group");
+        }
+        if (existing == ExistingGroup::missing) {
+            pendingGroupPosition = snapshot.roster.groupCount;
+            if (!append_state_local_group(
+                    *stateLocalRosterGroup, bubble, scratch, snapshot.roster)) {
+                return refuse_override("pending_append");
+            }
+        }
+    }
+    // The pending body applies last, so it wins over an older estate body for the same target.
+    if (authOverride != nullptr
+        && !install_auth_override(layout,
+                                  region,
+                                  scratch,
+                                  snapshot,
+                                  *authOverride,
+                                  rosterGroupIndex,
+                                  rosterSlotOffset,
+                                  stateLocalRosterTarget)) {
+        return refuse_override("pending_auth_apply");
+    }
+    // A burst commits behind the head and leaves on this body with it.
+    for (const TailAuthOverride& queued : tailOverrides) {
+        if (!install_auth_override(layout,
+                                   region,
+                                   scratch,
+                                   snapshot,
+                                   queued.value,
+                                   queued.rosterGroupIndex,
+                                   queued.rosterSlotOffset,
+                                   queued.stateLocalRosterTarget)) {
+            return refuse_override("tail_auth_apply");
+        }
+    }
+    // Read from the merged estate, so a pending disable wins over a retained enable.
+    namespace darkness = middleware::bap::activity_message::darkness_zone;
+    for (const auto& value : snapshot.authOverrides) {
+        bool enabled = false;
+        if (value.sdkCompiled && value.present && value.slotType == darkness::kSlotType
+            && value.authSchema == darkness::kSchema && value.byteCount <= value.body.size()
+            && darkness::read_enabled(
+                std::span(value.body).first(value.byteCount), value.bitCount, enabled)) {
+            snapshot.hasDarknessPolicy = true;
+            snapshot.darknessEnabled = enabled;
+        }
+    }
+    // Staging runs before the connection field is published, so a body answering message 52 has to
+    // take the epoch from that message instead of from the connection.
+    snapshot.patchEpoch = epoch != nullptr ? *epoch : session.activityPatchEpoch.value;
+    // The character the join named wins, resolved to its authored SOID. The client binds its
+    // player by matching this value against the object registry, and the short form the join
+    // carries matches nothing.
+    snapshot.playerKey = published_player_key(session);
+    snapshot.lifetime = lifetimeState;
+    snapshot.activityFlags = activityFlags;
+    // Each player owns its committed region readiness; a local writeback cannot ready peers.
+    // A program that opens on a cutscene holds the spawn too, so no body exists to place.
+    snapshot.awaitClientSync =
+        !client_region_ready(session, refresh)
+        || state::activity::membership::program_spawn_hold(session.activity.source.sessionId);
+    // Player_BindComponents walks every type-13 reference and the player datum can name any one of
+    // them. So every participation record carries the same player key. Selecting the first slot
+    // leaves the authored cinematic participant unbound whenever it names another record.
+    snapshot.keyOnEveryParticipationSlot = true;
+    // The participation record's `+0` latches only when the region index is known.
+    snapshot.region = static_cast<std::uint32_t>(region.index);
+    snapshot.hasRegion = true;
+    state::activity::membership::PendingMutation members{};
+    if (state::activity::membership::prepare_refresh(
+            session.activity.session.sessionId,
+            state::activity::membership::kAbsentRevision,
+            state::activity::membership::kMinimumRefreshBubble,
+            members)
+        && members.hasSnapshot) {
+        fill_member_roster(snapshot, members.memberDirectory, members.snapshot.identity.opaqueSoid);
+    }
+    // The override names the slice set the client is in. The client applies a pair only there, and
+    // a forced set with no point in that slice set leaves the biped picker with no transform.
+    snapshot.spawnSliceSet =
+        region.index >= 0 ? static_cast<std::uint32_t>(region.index) : region.arrival;
+    snapshot.spawnSetHash =
+        state::activity::destination::attachable_spawn_set_hash(selection, fallback.spawnSetHash);
+    // The mission program owns its spawn set. A manual launch pick still wins over it.
+    const std::uint32_t declaredSpawn =
+        state::activity::membership::declared_spawn_set(session.activity.source.sessionId);
+    const bool programOwnsSpawn = declaredSpawn != 0 && !selection.hasSpawnSetOverride;
+    if (programOwnsSpawn) {
+        snapshot.spawnSetHash = declaredSpawn;
+    }
+    // A set answers only the slice sets of the bubble that declares it, so the program's set holds
+    // across a move while a derived set answers the arrival alone.
+    const std::uint16_t setAnswers = programOwnsSpawn
+                                         ? static_cast<std::uint16_t>(snapshot.spawnSliceSet)
+                                         : static_cast<std::uint16_t>(region.arrival);
+    // The program's set is declared by its own destination. A public link runs another one, whose
+    // tables do not list the set and so cannot say where it has points.
+    const state::activity::destination::DestinationSelection& setOwner =
+        programOwnsSpawn ? session.activity.source.destination : selection;
+    if (snapshot.spawnSliceSet
+        != state::activity::destination::spawn_set_slice_set(
+            setOwner, snapshot.spawnSetHash, setAnswers)) {
+        snapshot.spawnSetHash = message::kAbsentSpawnSetHash;
+    }
+    // A host teleport that named a spawn set leaves it as this region's arrival point.
+    const std::uint32_t teleported = state::activity::membership::host_spawn_set(
+        session.activity.source.sessionId, region.index);
+    if (teleported != 0) {
+        snapshot.spawnSetHash = teleported;
+    }
+    // An armed wipe respawns at its checkpoint spawn set, not at the arrival override.
+    const std::uint32_t checkpoint = state::activity::membership::checkpoint_spawn_hash(
+        session.activity.source.sessionId, region.index);
+    if (checkpoint != 0) {
+        snapshot.spawnSetHash = checkpoint;
+    }
+    snapshot.hasSpawnOverride =
+        snapshot.spawnSetHash != 0 && snapshot.spawnSetHash != message::kAbsentSpawnSetHash;
+    std::size_t firstAppended = seedGroupCount;
+    if (!promote_scenario_wide_groups(session, scratch, snapshot.roster, firstAppended)) {
+        return refuse_override("scenario_wide_groups");
+    }
+    // The client keys its state bytes by position, so the appended groups take the order of their
+    // first push and keep every bubble they were registered under.
+    order_appended_groups(session, scratch, snapshot.roster, firstAppended);
+    if (!retain_group_bubbles(session, scratch, snapshot.roster)) {
+        return refuse_override("group_bubbles");
+    }
+    order_sub_blocks(session, scratch, snapshot.roster);
+    for (std::size_t index = 0; retainedSquad && index < lease.groupCount; ++index) {
+        if (retainedGroupPositions[index] >= snapshot.roster.groups.size()) {
+            continue;
+        }
+        retainedGroupPositions[index] = snapshot.roster.groups.size();
+        const std::uint32_t key = lease.groups[index].scopeTarget.registryKey;
+        for (std::size_t position = 0; position < snapshot.roster.groupCount; ++position) {
+            if (snapshot.roster.groups[position].key == key) {
+                retainedGroupPositions[index] = position;
+                break;
+            }
+        }
+    }
+    if (pendingStateLocal) {
+        pendingGroupPosition = snapshot.roster.groups.size();
+        for (std::size_t position = 0; position < snapshot.roster.groupCount; ++position) {
+            if (snapshot.roster.groups[position].key == pendingTarget.registryKey) {
+                pendingGroupPosition = position;
+                break;
+            }
+        }
+    }
+    advance_region_epoch(session, refresh);
+    stamp_group_sequences(session, snapshot.roster);
+    snapshot.stateSequence = session.activityRosterState;
+    // One-shot first-roster flag; the mission seed's adoption guard reads it.
+    if (session.activityRosterSends == 0) {
+        session.activityRosterSends = 1;
+    }
+    // A retained key holds its revision, so a later Auth change cannot re-register the group and
+    // rebuild its actors. A bubble change re-arms it once per epoch; the client unloads the group
+    // with the bubble.
+    for (std::size_t index = 0; retainedSquad && index < lease.groupCount; ++index) {
+        const std::size_t position = retainedGroupPositions[index];
+        if (position >= snapshot.roster.groupCount) {
+            continue;
+        }
+        RetainedSquadGroup& retained = session.activitySquadOverride.groups[index];
+        if (retained.regionEpoch == session.activityRosterRegionEpoch) {
+            snapshot.roster.groups[position].stateSequence = retained.stateSequence;
+            continue;
+        }
+        retained.regionEpoch = session.activityRosterRegionEpoch;
+        retained.stateSequence = snapshot.roster.groups[position].stateSequence;
+    }
+    if (pendingStateLocal && pendingGroupPosition >= snapshot.roster.groupCount) {
+        return refuse_override("pending_group_position");
+    }
+    // Only this recipient's own native recovery reports are replayed. Retire departed
+    // connections without letting a newer guest evict another live member's reports. A departed
+    // holder's reports stay until the bubble it released is granted again.
+    namespace authority = state::activity::bubble_authority;
+    std::array<std::uint64_t, core::network_capacity::kConnections + authority::kAuthoritySlotCount>
+        liveSources{};
+    std::size_t liveCount{};
+    bool completeSources = true;
+    for (const auto& peer : sessions()) {
+        if (!mission_seed_recipient(peer, session.activity.session)) {
+            continue;
+        }
+        if (liveCount == core::network_capacity::kConnections) {
+            completeSources = false;
+            break;
+        }
+        liveSources[liveCount++] = peer.activity.bindingGeneration;
+    }
+    authority::GrantHolders releasers{};
+    authority::grant_releasers(session.activity.session.sessionId, releasers);
+    for (const std::uint64_t releaser : releasers) {
+        if (releaser != 0) {
+            liveSources[liveCount++] = releaser;
+        }
+    }
+    if (completeSources) {
+        // Reports are stamped with the attempt they arrived in, read the same way.
+        state::activity::mission::InputSequenceSnapshot attempt{};
+        static_cast<void>(
+            state::activity::mission::input_sequence_snapshot(session.activity.session, attempt));
+        server::activity::host::retain_squad_sense_generations(
+            session.activity.session,
+            std::span(liveSources).first(liveCount),
+            attempt.attemptGeneration);
+    }
+    std::size_t senseCount = 0;
+    for (const message::AuthOverride& auth : snapshot.authOverrides) {
+        if (auth.slotType != 1) {
+            continue;
+        }
+        server::activity::host::SenseObservationKey key{};
+        key.registryKey = auth.key;
+        key.objectTag = auth.objectTag;
+        key.senseSchema = middleware::bap::activity_message::squad_sense::kSchema;
+        key.slotIndex = auth.slotIndex;
+        key.slotType = auth.slotType;
+        // The owner's mission records its groups' reports under the owner's own link.
+        const bool ownerGroup = owner != nullptr && owner_key(scratch, auth.key);
+        middleware::bap::activity_message::squad_sense::State recovered{};
+        if (!server::activity::host::snapshot_squad_sense(
+                ownerGroup ? owner->activity.session : session.activity.session,
+                ownerGroup ? owner->activity.bindingGeneration : session.activity.bindingGeneration,
+                key,
+                recovered)) {
+            continue;
+        }
+        message::SenseOverride& sense = scratch.rosterSenseOverrides[senseCount];
+        sense = {};
+        if (!middleware::bap::activity_message::squad_sense::encode(
+                recovered, sense.body, sense.byteCount, sense.bitCount)) {
+            return refuse_override("squad_sense");
+        }
+        sense.key = auth.key;
+        sense.objectTag = auth.objectTag;
+        sense.slotIndex = auth.slotIndex;
+        sense.slotType = auth.slotType;
+        sense.counter = recovered.counter;
+        ++senseCount;
+    }
+    // The client cannot cross the Ghost-link duration on its own, so the host publishes the Sense
+    // root beside the unchanged Auth root: above 1.0 finishes the scene, 0.0 re-arms it.
+    namespace ghostAuth = middleware::bap::activity_message::ghost_link;
+    namespace ghostSense = middleware::bap::activity_message::ghost_link_sense;
+    for (const message::AuthOverride& auth : snapshot.authOverrides) {
+        // A slot the packages give no Sense schema carries no override; one sent anyway would
+        // refuse the whole body.
+        if (auth.slotType != ghostAuth::kSlotType || auth.authSchema != ghostAuth::kAuthSchema
+            || !declares_sense_slot(snapshot.roster, auth)) {
+            continue;
+        }
+        server::activity::host::SenseObservationKey key{};
+        key.registryKey = auth.key;
+        key.objectTag = auth.objectTag;
+        key.senseSchema = ghostAuth::kSenseSchema;
+        key.slotIndex = auth.slotIndex;
+        key.slotType = auth.slotType;
+        server::activity::host::GhostLinkLevel level{};
+        const bool ownerGroup = owner != nullptr && owner_key(scratch, auth.key);
+        if (!server::activity::host::ghost_link_scan(
+                ownerGroup ? owner->activity.session : session.activity.session, key, level)) {
+            continue;
+        }
+        message::SenseOverride& sense = scratch.rosterSenseOverrides[senseCount];
+        sense = {};
+        if (!ghostSense::encode(level.finished,
+                                level.finished ? ghostSense::kFinishedFraction : 0.0F,
+                                level.generation,
+                                sense.body,
+                                sense.byteCount,
+                                sense.bitCount)) {
+            return refuse_override("ghost_link_sense");
+        }
+        sense.key = auth.key;
+        sense.objectTag = auth.objectTag;
+        sense.slotIndex = auth.slotIndex;
+        sense.slotType = auth.slotType;
+        sense.counter = level.counter;
+        ++senseCount;
+    }
+    snapshot.senseOverrides = std::span(scratch.rosterSenseOverrides).first(senseCount);
+    return RosterOutcome::published;
+}
+
+namespace {
+
+/**
+ * @return True when one squad slot names a squad authored in the given bubble. A slot that more
+ * than one squad row places counts when any of them is.
+ */
+[[nodiscard]] bool squad_in_bubble(const state::activity_sdk::BoundView& view,
+                                   const server::activity::host::SenseObservationKey& squad,
+                                   std::uint8_t bubble) noexcept {
+    namespace squads = server::activity::activity_sdk_squads;
+    const auto rows = view.catalog->squads();
+    const auto slots = view.catalog->slots();
+    const auto objects = view.catalog->objects();
+    for (std::size_t row = 0; row < rows.size(); ++row) {
+        const std::uint32_t slotRow = rows[row].slotIndex;
+        if (slotRow >= slots.size() || slots[slotRow].objectIndex >= objects.size()
+            || objects[slots[slotRow].objectIndex].objectKey != squad.registryKey
+            || slots[slotRow].slotIndex != squad.slotIndex
+            || slots[slotRow].slotType != squad.slotType) {
+            continue;
+        }
+        std::uint8_t authored = 0;
+        if (squads::authored_bubble(view, static_cast<std::uint32_t>(row), authored)
+                == squads::Status::ready
+            && authored == bubble) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+namespace {
+
+/** @return How many slots of the roster declare this squad's Sense; the encoder needs one. */
+[[nodiscard]] std::size_t
+sense_slots(const message::Roster& roster,
+            const server::activity::host::SenseObservationKey& squad) noexcept {
+    std::size_t matches = 0;
+    for (const message::Group& group : std::span(roster.groups).first(roster.groupCount)) {
+        if (group.key != squad.registryKey || group.objectTag != squad.objectTag) {
+            continue;
+        }
+        for (std::size_t slot = 0; slot < group.slotTypes.size(); ++slot) {
+            if (group.slotTypes[slot] == squad.slotType
+                && group.slotIndices[slot] == squad.slotIndex
+                && (group.slotFlags[slot] & message::kSlotSenseFlag) != 0) {
+                ++matches;
+            }
+        }
+    }
+    return matches;
+}
+
+} // namespace
+
+void append_handover_squad_sense(const Session& session,
+                                 Scratch& scratch,
+                                 message::Snapshot& snapshot,
+                                 std::uint8_t bubble,
+                                 std::uint64_t releaser,
+                                 HandoverSquadSense& output) noexcept {
+    namespace sdk = state::activity_sdk;
+    namespace squadSense = middleware::bap::activity_message::squad_sense;
+    output = {};
+    output.releaser = releaser;
+    output.bubble = bubble;
+    const sdk::Snapshot catalog = sdk::snapshot();
+    sdk::BoundView view{};
+    const sdk::Selection selection{session.activity.session, 1, session.activity.bindingGeneration};
+    if (catalog == nullptr || sdk::resolve(catalog, selection, view) != sdk::Status::ready
+        || view.catalog == nullptr) {
+        return;
+    }
+    // The releaser's and the recipient's records name every squad either ran, with or without an
+    // Auth in this body.
+    std::array<server::activity::host::SenseObservationKey, kHandoverSquadCapacity> released{};
+    const std::size_t releasedCount = server::activity::host::handover_squad_sense_keys(
+        session.activity.session, session.activity.bindingGeneration, releaser, released);
+    std::size_t count = snapshot.senseOverrides.size();
+    for (const auto& key : std::span(released).first(releasedCount)) {
+        if (key.slotType != squadSense::kSlotType || key.senseSchema != squadSense::kSchema
+            || !squad_in_bubble(view, key, bubble) || sense_slots(snapshot.roster, key) != 1) {
+            continue;
+        }
+        squadSense::State recovered{};
+        if (!server::activity::host::snapshot_handover_squad_sense(
+                session.activity.session,
+                session.activity.bindingGeneration,
+                releaser,
+                bubble,
+                key,
+                recovered)) {
+            continue;
+        }
+        // The handover replaces this body's replay of the recipient's older own record.
+        const auto present = std::span(scratch.rosterSenseOverrides).first(count);
+        const auto existing =
+            std::find_if(present.begin(), present.end(), [&](const message::SenseOverride& sense) {
+                return sense.key == key.registryKey && sense.objectTag == key.objectTag
+                       && sense.slotIndex == key.slotIndex && sense.slotType == key.slotType;
+            });
+        if (existing == present.end() && count == scratch.rosterSenseOverrides.size()) {
+            continue;
+        }
+        message::SenseOverride sense{};
+        // A body that does not encode is left out; the recipient then starts the squad natively.
+        if (!squadSense::encode(recovered, sense.body, sense.byteCount, sense.bitCount)) {
+            continue;
+        }
+        sense.key = key.registryKey;
+        sense.objectTag = key.objectTag;
+        sense.slotIndex = key.slotIndex;
+        sense.slotType = key.slotType;
+        sense.counter = recovered.counter;
+        if (existing != present.end()) {
+            *existing = sense;
+        } else {
+            scratch.rosterSenseOverrides[count++] = sense;
+        }
+        output.keys[output.count++] = key;
+    }
+    snapshot.senseOverrides = std::span(scratch.rosterSenseOverrides).first(count);
+}
+
+/** The player key this link's message 5 binds: the join character's SOID, or its identity. */
+std::uint64_t published_player_key(const Session& session) noexcept {
+    state::activity::defaults::ActivityDefaults defaults{};
+    state::activity::defaults::snapshot(defaults);
+    std::uint64_t key = roster_player_key(session.activityCharacterSoid);
+    if (defaults.rosterKeyFromIdentity) {
+        const std::uint64_t identity =
+            state::activity::membership::join_identity(session.activity.session.sessionId);
+        if (identity != 0) {
+            key = identity;
+        }
+    }
+    return key;
+}
+
+} // namespace sunrise::server::bap::encrypted::push::activity

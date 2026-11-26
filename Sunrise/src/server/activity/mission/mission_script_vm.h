@@ -1,0 +1,678 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string_view>
+
+#include "../../../state/activity_sdk/format.h"
+#include "../../../state/mods/definition.h"
+#include "../host_runtime.h"
+#include "mission_script_catalog_sdk.h"
+#include "mission_script_ghost_sense.h"
+#include "mission_script_manifest_sdk.h"
+#include "mission_script_objective_sense.h"
+#include "mission_script_squad_sense.h"
+#include "mission_script_world_sdk.h"
+
+namespace sunrise::server::activity::mission::lua_vm {
+
+namespace detail {
+struct VmAccess;
+}
+
+/** Lua ceiling per open program. The largest generated module peaks near 23 MiB. */
+// Raised from 64 MiB: generated mission SDK modules now need ~70 MiB with arena headers
+// (hunt_foul alone is 540k allocations). Pages are only touched as Lua uses them.
+inline constexpr std::size_t kArenaByteCapacity = 256U * 1024U * 1024U;
+inline constexpr std::size_t kVariableCapacity = state::activity::mission::kVariableCapacity;
+inline constexpr std::size_t kTimerCapacity = state::activity::mission::kTimerCapacity;
+inline constexpr std::size_t kStateKeyByteCapacity =
+    state::activity::mission::kStateKeyByteCapacity;
+/** One variable string may not outgrow the durable slot the state holds it in. */
+inline constexpr std::size_t kVariableStringByteCapacity =
+    state::activity::mission::kVariableStringByteCapacity;
+inline constexpr std::size_t kSquadMemberCapacity = state::activity::mission::kSquadMemberCapacity;
+/** Script source is bounded before it reaches the parser. */
+inline constexpr std::size_t kSourceByteCapacity = 128U * 1024U;
+/** One callback is stopped after this many approximate VM instructions. */
+inline constexpr std::uint32_t kInstructionBudget = 5'000'000;
+/** Generated mission modules are large declarations and execute only while a VM opens. */
+inline constexpr std::uint32_t kInitializationInstructionBudget = 100'000'000;
+/** Stable storage holds everything but the arena block, which the open program owns. */
+inline constexpr std::size_t kVmStorageByteCapacity = 512U * 1024U;
+/** The require path holds the two base roots and two roots per loaded mod. */
+inline constexpr std::size_t kSearchPathByteCapacity = 32U * 1024U;
+
+/** Reads the current value of one config entry a mod declares; false when it declares none. */
+using ModConfigReader = bool (*)(std::string_view modId,
+                                 std::string_view key,
+                                 state::mods::ConfigValue& output) noexcept;
+
+/** Resolves a loaded file's mod id; empty means unowned and false refuses attribution. */
+using ModuleOwnerReader = bool (*)(std::string_view path, std::span<char> modId) noexcept;
+
+/** One per-save flag value, keyed by the program's mod id and a name. */
+struct SaveFlag final {
+    state::activity::mission::StateKey name{};
+    std::int64_t value{};
+    /** The value is 0 or 1 and reads back as a boolean. */
+    bool boolean{};
+    /** False means no flag: read as nil, written as a removal. */
+    bool present{};
+};
+
+/** Flag changes one callback may stage; they are written when it commits. */
+inline constexpr std::size_t kSaveFlagWriteCapacity = 32;
+
+/** Reads one flag; false when the save does not answer. */
+using SaveFlagReader = bool (*)(std::string_view modId,
+                                const state::activity::mission::StateKey& name,
+                                SaveFlag& output) noexcept;
+/** Writes one callback's flag changes in one transaction; false changes none. */
+using SaveFlagWriter = bool (*)(std::string_view modId, std::span<const SaveFlag> flags) noexcept;
+
+/** Current generated identity selected by the runtime before a program attaches. */
+struct ProgramIdentity final {
+    std::array<char, 72> sdkBuildId{};
+    std::array<char, 64> activityId{};
+    /** The only filesystem search path available to generated-module require calls. */
+    std::array<char, kSearchPathByteCapacity> sdkLuaSearchPath{};
+    std::uint32_t activityRow{};
+    std::uint32_t definitionHash{};
+    /** The player key the bound link's message 5 binds; the client matches it on its own datum. */
+    std::uint64_t playerKey{};
+    /** Session generation whose message-5 clock directive epochs count on. */
+    std::uint64_t sessionId{};
+    /** Exact allocation generation; prevents reusing a retired session's clock. */
+    std::uint64_t sessionCreatedRevision{};
+    /** Id of the mod that supplied the controller; empty for a base or generated script. */
+    std::array<char, state::mods::kIdCapacity> modId{};
+    /** Reads `context.mod_config`; null leaves every entry nil. */
+    ModConfigReader readModConfig{};
+    ModuleOwnerReader readModuleOwner{};
+    /** Per-save flag store; null refuses every flag call. */
+    SaveFlagReader readSaveFlag{};
+    SaveFlagWriter writeSaveFlags{};
+    /** Exact ActivityClient directory selected for this VM. */
+    bool publicTarget{};
+};
+
+/** One activity-local squad row resolved against the pinned SDK view. */
+struct SquadDefinition final {
+    std::array<std::int32_t, kSquadMemberCapacity> defaultCounts{};
+    std::string_view id{};
+    std::string_view name{};
+    std::uint32_t nativeRow{};
+    /** Catalog row of the squad's authored type-1 slot. */
+    std::uint32_t slotRow{};
+    std::uint32_t localRow{};
+    std::size_t memberCount{};
+};
+
+/** One activity-local authored-scene row resolved against the pinned SDK view. */
+struct SceneDefinition final {
+    std::array<char, 512> id{};
+    std::uint32_t occurrenceRow{};
+    std::uint32_t slotRow{};
+    std::uint32_t localRow{};
+    std::size_t idLength{};
+};
+
+/** One scenario-local reusable object slot resolved against the pinned SDK view. */
+struct SlotDefinition final {
+    std::string_view id{};
+    std::string_view name{};
+    std::string_view objectId{};
+    std::string_view senseSchemaId{};
+    std::string_view authSchemaId{};
+    std::uint32_t nativeRow{};
+    std::uint32_t localRow{};
+    std::uint32_t objectTag{};
+    std::uint32_t registryKey{};
+    std::uint32_t slotIndex{};
+    std::uint32_t slotType{};
+    std::uint32_t componentClass{};
+    std::uint32_t senseSchema{};
+    std::uint32_t authSchema{};
+    std::uint32_t flags{};
+    /** Runtime-extracted writable object channels; zero when unverified. */
+    std::uint8_t objectChannelCount{};
+    /** FNV-1 of the slot name, the hash the packages key the slot by. */
+    std::uint32_t nameHash{};
+    /** Slice-set hash of the object's bubble in this scenario, or zero when unknown. */
+    std::uint32_t bubbleHash{};
+};
+
+/**
+ * One type-38 task-sensor target whose authored reference was proved to resolve.
+ * The client calls through that reference without a null check, so an unresolved target is fatal.
+ */
+struct TaskSensorDefinition final {
+    std::string_view id{};
+    std::uint32_t localRow{};
+    std::uint32_t slotRow{};
+    /** Authored object key the slot record's reference resolves to. */
+    std::uint32_t targetObjectKey{};
+    /** Authored bit index the applier clears. It is authored, never a caller parameter. */
+    std::uint32_t bitIndex{};
+};
+
+/**
+ * One type-68 directive element proved against the authored directive list.
+ * The client indexes by the element index with no bound, and dereferences the hash lookup with
+ * no null check. So both must already have resolved before a caller can name this element.
+ */
+struct DirectiveElementDefinition final {
+    std::string_view id{};
+    std::uint32_t localRow{};
+    std::uint32_t slotRow{};
+    /** Name hash an authored directive owns. A hash owning nothing never becomes a handle. */
+    std::uint32_t nameHash{};
+    /** Index inside the owning authored sub-array, already inside its real length. */
+    std::int32_t elementIndex{};
+    /** Rows that sub-array holds, so the bound is the array's, never the wire lane's width. */
+    std::uint32_t elementCount{};
+    /** Authored flag word; the counter bit says the HUD shows the lane's progress values. */
+    std::uint32_t flags{};
+};
+
+/** One state name a type-42 performance sensor may start on the actor it drives. */
+struct PerformanceStateDefinition final {
+    std::uint32_t slotRow{};
+    /** FNV-1 of the state name in the target actor's state-machine definition. */
+    std::uint32_t nameHash{};
+    /** Distinct state names every member of the target squad declares. */
+    std::uint32_t stateCount{};
+};
+
+using ActorSequenceOwner = state::activity::mission::ActorSequenceOwner;
+
+/** One extracted sequence entry; unsupported native kinds remain readable. */
+struct ActorSequenceDefinition final {
+    std::string_view id{};
+    std::string_view name{};
+    std::string_view symbol{};
+    std::string_view sourcePath{};
+    std::uint32_t catalogRow{};
+    std::uint32_t keyHash{};
+    std::uint32_t kind{};
+    std::uint32_t resourceTag{};
+    std::uint32_t tableIndex{};
+    std::uint32_t ordinal{};
+    std::uint32_t sourceOffset{};
+    bool playable{};
+};
+
+/** These callbacks reread the exact actor owner before exposing or playing a value. */
+struct ActorSequenceApi final {
+    const void* context{};
+    bool (*owner)(const void*, std::uint32_t slotRow, ActorSequenceOwner&) noexcept {};
+    std::size_t (*count)(const void*, const ActorSequenceOwner&) noexcept {};
+    bool (*resolve)(const void*,
+                    const ActorSequenceOwner&,
+                    std::uint32_t ordinal,
+                    ActorSequenceDefinition&) noexcept {};
+};
+
+/** One peer session bound to this destination, as the roster currently holds it. */
+struct PeerSession final {
+    std::uint64_t sessionId{};
+    /** Record generation, so a replacement is told apart from the record it replaced. */
+    std::uint64_t sessionGeneration{};
+    /** Peer client key bound by its join, or zero before one. */
+    std::uint64_t memberKey{};
+    /** The identity message 12 publishes for the peer, which is also its message-5 player key. */
+    std::uint64_t joinIdentity{};
+};
+
+/** Peers the VM can report. It is the activity session capacity, not a bound of its own. */
+inline constexpr std::size_t kPeerCapacity = state::activity::kSessionCapacity;
+
+/** One generated typed Lua surface owned by an activity-message route. */
+struct ActivityMessageSurfaceDefinition final {
+    std::string_view id{};
+    std::string_view luaName{};
+};
+
+/** Capacity follows the generated mission-surface section, not current msg-5 callability. */
+inline constexpr std::size_t kActivityMessageSurfaceCapacity =
+    state::activity_sdk::format::kMissionSurfaceCount;
+
+/** One checked activity-message row resolved from the pinned SDK view. */
+struct ActivityMessageDefinition final {
+    std::array<ActivityMessageSurfaceDefinition, kActivityMessageSurfaceCapacity> ingressSurfaces{};
+    std::array<ActivityMessageSurfaceDefinition, kActivityMessageSurfaceCapacity> egressSurfaces{};
+    std::string_view name{};
+    std::string_view ingressAdapter{};
+    std::string_view ingressAdapterPath{};
+    std::string_view ingressClass{};
+    std::string_view egressAdapter{};
+    std::string_view egressAdapterPath{};
+    std::string_view egressClass{};
+    std::string_view outputCodec{};
+    std::string_view outputCodecPath{};
+    std::string_view stateOwner{};
+    std::string_view stateOwnerPath{};
+    std::string_view luaExposure{};
+    std::string_view ingressDelivery{};
+    std::string_view egressDelivery{};
+    std::string_view lateJoinHandoff{};
+    std::string_view ingressStatus{};
+    std::string_view egressStatus{};
+    std::uint32_t localRow{};
+    std::uint32_t messageId{};
+    std::uint32_t direction{};
+    std::uint32_t coverage{};
+    std::uint32_t definitionHandle{};
+    std::uint32_t callForm{};
+    std::uint32_t definitionState{};
+    std::uint32_t definitionStructSize{};
+    std::uint32_t wireMinBits{};
+    std::uint32_t wireMaxBits{};
+    std::uint32_t fieldCount{};
+    std::uint32_t namedFieldCount{};
+    std::uint32_t graphFieldCount{};
+    std::uint32_t authoredFieldCount{};
+    std::uint32_t typedLuaSurfaceCount{};
+    std::uint32_t communicationFlags{};
+    std::uint32_t flags{};
+    std::uint8_t ingressSurfaceCount{};
+    std::uint8_t egressSurfaceCount{};
+    bool executableRoute{};
+};
+
+/** One checked field row owned by an activity message in the pinned SDK view. */
+struct ActivityMessageFieldDefinition final {
+    std::string_view path{};
+    std::string_view name{};
+    std::string_view type{};
+    std::uint32_t localRow{};
+    std::uint32_t globalRow{};
+    std::uint32_t messageRow{};
+    std::uint32_t ordinal{};
+    std::uint32_t source{};
+    std::uint32_t structOffset{};
+    std::uint32_t structOffsetAbs{};
+    std::uint32_t typeCode{};
+    std::int64_t bias{};
+    std::uint32_t bits{};
+    std::uint32_t bitsMin{};
+    std::uint32_t bitsMax{};
+    std::uint32_t widthOrCountOffset{};
+    std::uint32_t repeat{};
+    std::uint32_t nestedHandle{};
+    std::uint32_t ownerHandle{};
+    std::uint32_t depth{};
+    std::uint32_t flags{};
+    std::uint32_t confidence{};
+};
+
+/** Complete authenticated binding metadata for the activity owning this script VM. */
+struct ActivityBindingDefinition final {
+    std::string_view internalName{};
+    std::string_view displayName{};
+    std::uint32_t selectedActivityRootTag{};
+    std::uint32_t selectedScenarioTag{};
+    std::uint32_t matchmakingConfigTag{};
+    std::uint32_t joinStatus{};
+    std::uint32_t bindingDisposition{};
+    std::uint32_t bindingReason{};
+    std::uint32_t bindingEvidenceBasis{};
+    std::uint32_t runnableStatus{};
+    bool fullSdkAcceptable{};
+    bool hasInternalName{};
+    bool hasMatchmakingConfig{};
+};
+
+/** Which closed tag range one immutable ActivityView collection exposes. */
+enum class ActivityBindingTagKind : std::uint8_t {
+    activityRootCandidates,
+    scenarioNameCandidates,
+    evidenceRoots,
+};
+
+/** One exact package locator supporting the current activity classification. */
+struct ActivityBindingLocatorDefinition final {
+    std::uint32_t tag{};
+    std::uint64_t offset{};
+    std::uint32_t localRow{};
+};
+
+using ActionKind = state::activity::mission::IntentKind;
+
+using StateKey = state::activity::mission::StateKey;
+using VariableValueKind = state::activity::mission::VariableValueKind;
+using VariableValue = state::activity::mission::VariableValue;
+using ScriptVariable = state::activity::mission::ScriptVariable;
+using MissionTimer = state::activity::mission::MissionTimer;
+
+using IntentKind = ActionKind;
+
+using ResolveSquadRow = bool (*)(const void* context,
+                                 std::uint32_t localRow,
+                                 SquadDefinition& output) noexcept;
+using ResolveSquadId = bool (*)(const void* context,
+                                std::string_view id,
+                                SquadDefinition& output) noexcept;
+using ResolveSceneRow = bool (*)(const void* context,
+                                 std::uint32_t localRow,
+                                 SceneDefinition& output) noexcept;
+using ResolveSceneId = bool (*)(const void* context,
+                                std::string_view id,
+                                SceneDefinition& output) noexcept;
+using ResolveSlotRow = bool (*)(const void* context,
+                                std::uint32_t localRow,
+                                SlotDefinition& output) noexcept;
+using ResolveSlotId = bool (*)(const void* context,
+                               std::string_view id,
+                               SlotDefinition& output) noexcept;
+using ResolveSenseSlot = bool (*)(const void* context,
+                                  const host::SenseObservationKey& key,
+                                  SlotDefinition& output) noexcept;
+using ResolveTaskSensorRow = bool (*)(const void* context,
+                                      std::uint32_t localRow,
+                                      TaskSensorDefinition& output) noexcept;
+using ResolveTaskSensorId = bool (*)(const void* context,
+                                     std::string_view id,
+                                     TaskSensorDefinition& output) noexcept;
+using ResolveDirectiveElementRow = bool (*)(const void* context,
+                                            std::uint32_t localRow,
+                                            DirectiveElementDefinition& output) noexcept;
+using ResolveDirectiveElement = bool (*)(const void* context,
+                                         std::uint32_t slotRow,
+                                         std::uint32_t nameHash,
+                                         std::int32_t elementIndex,
+                                         DirectiveElementDefinition& output) noexcept;
+/** A zero name hash selects the one state the slot's target declares, and refuses any other. */
+using ResolvePerformanceState = bool (*)(const void* context,
+                                         std::uint32_t slotRow,
+                                         std::uint32_t nameHash,
+                                         PerformanceStateDefinition& output) noexcept;
+using ResolveActivityMessageRow = bool (*)(const void* context,
+                                           std::uint32_t localRow,
+                                           ActivityMessageDefinition& output) noexcept;
+using ResolveActivityMessageId = bool (*)(const void* context,
+                                          std::uint32_t messageId,
+                                          ActivityMessageDefinition& output) noexcept;
+using ResolveActivityMessageName = bool (*)(const void* context,
+                                            std::string_view name,
+                                            ActivityMessageDefinition& output) noexcept;
+using ResolveActivityMessageFieldRow = bool (*)(const void* context,
+                                                std::uint32_t messageRow,
+                                                std::uint32_t localRow,
+                                                ActivityMessageFieldDefinition& output) noexcept;
+using ResolveActivityMessageFieldIndex = bool (*)(const void* context,
+                                                  std::uint32_t messageId,
+                                                  std::uint32_t globalFieldIndex,
+                                                  ActivityMessageFieldDefinition& output) noexcept;
+using ResolveActivityBinding = bool (*)(const void* context,
+                                        ActivityBindingDefinition& output) noexcept;
+using ActivityBindingTagCount = std::size_t (*)(const void* context,
+                                                ActivityBindingTagKind kind) noexcept;
+using ResolveActivityBindingTag = bool (*)(const void* context,
+                                           ActivityBindingTagKind kind,
+                                           std::uint32_t localRow,
+                                           std::uint32_t& output) noexcept;
+using ActivityBindingLocatorCount = std::size_t (*)(const void* context) noexcept;
+using ResolveActivityBindingLocator = bool (*)(const void* context,
+                                               std::uint32_t localRow,
+                                               ActivityBindingLocatorDefinition& output) noexcept;
+using DefinitionCount = std::size_t (*)(const void* context) noexcept;
+
+/** Exact authored task group with its objective's native ClientRef and its task bounds. */
+struct CombatObjectiveGroupDefinition final {
+    std::uint32_t slotRow{};
+    std::uint32_t groupIndex{};
+    std::uint32_t registryKey{};
+    std::uint16_t slotIndex{};
+    std::uint32_t taskCount{};
+    std::array<state::activity_sdk::format::CombatTaskBounds,
+               state::activity_sdk::format::kCombatTaskCapacity>
+        tasks{};
+};
+
+/** Native SDK/live projection used by the sandbox; no borrowed pointer is script-visible. */
+struct DefinitionApi final {
+    const void* context{};
+    bool (*resolveCombatObjectiveGroup)(const void* context,
+                                        std::uint32_t slotRow,
+                                        std::uint32_t groupIndex,
+                                        CombatObjectiveGroupDefinition& output) noexcept {};
+    bool (*resolveActorAbility)(const void* context,
+                                std::uint32_t slotRow,
+                                std::uint32_t groupHash,
+                                std::uint32_t requestHash) noexcept {};
+    bool (*resolveActorAbilityTarget)(const void* context,
+                                      std::uint32_t slotRow,
+                                      std::uint32_t selectorIndex) noexcept {};
+    /** True when the slot's actor or squad members' behaviour program holds the temperament. */
+    bool (*resolveActorTemperament)(const void* context,
+                                    std::uint32_t slotRow,
+                                    std::uint32_t id) noexcept {};
+    /** True when the slot's actor has the channel as a mission.ActorChannel row. */
+    bool (*resolveActorChannel)(const void* context,
+                                std::uint32_t slotRow,
+                                std::uint32_t nameHash) noexcept {};
+    bool (*resolveActorProgramSource)(const void* context,
+                                      std::uint32_t slotRow,
+                                      std::uint32_t& squadRow) noexcept {};
+    bool (*resolveSceneSpawnSources)(const void* context,
+                                     std::uint32_t occurrenceRow,
+                                     std::uint32_t slotRow,
+                                     std::span<std::uint32_t> sources,
+                                     std::size_t& count) noexcept {};
+    ResolveSquadRow resolveSquadRow{};
+    ResolveSquadId resolveSquadId{};
+    ResolveSceneRow resolveSceneRow{};
+    ResolveSceneId resolveSceneId{};
+    ResolveSlotRow resolveSlotRow{};
+    ResolveSlotId resolveSlotId{};
+    ResolveSenseSlot resolveSenseSlot{};
+    // TODO: add the Lua task and directive row bindings; only resolveDirectiveElement is read.
+    ResolveTaskSensorRow resolveTaskSensorRow{};
+    ResolveTaskSensorId resolveTaskSensorId{};
+    ResolveDirectiveElementRow resolveDirectiveElementRow{};
+    ResolveDirectiveElement resolveDirectiveElement{};
+    ResolvePerformanceState resolvePerformanceState{};
+    ActorSequenceApi actorSequences{};
+    ResolveActivityMessageRow resolveActivityMessageRow{};
+    ResolveActivityMessageId resolveActivityMessageId{};
+    ResolveActivityMessageName resolveActivityMessageName{};
+    ResolveActivityMessageFieldRow resolveActivityMessageFieldRow{};
+    ResolveActivityMessageFieldIndex resolveActivityMessageFieldIndex{};
+    ResolveActivityBinding resolveActivityBinding{};
+    ActivityBindingTagCount activityBindingTagCount{};
+    ResolveActivityBindingTag resolveActivityBindingTag{};
+    ActivityBindingLocatorCount activityBindingLocatorCount{};
+    ResolveActivityBindingLocator resolveActivityBindingLocator{};
+    DefinitionCount squadCount{};
+    DefinitionCount sceneCount{};
+    DefinitionCount slotCount{};
+    DefinitionCount taskSensorCount{};
+    DefinitionCount directiveElementCount{};
+    DefinitionCount activityMessageCount{};
+    CatalogDefinitionApi catalog{};
+    ManifestDefinitionApi manifest{};
+    WorldDefinitionApi world{};
+};
+
+using Intent = state::activity::mission::TypedIntent;
+
+/** Stable program-open outcome. */
+enum class OpenStatus : std::uint8_t {
+    ready,
+    sourceTooLarge,
+    outOfMemory,
+    compileError,
+    runtimeError,
+    invalidProgram,
+};
+
+/** Stable protected-callback outcome. */
+enum class CallStatus : std::uint8_t {
+    committed,
+    noHandler,
+    inactive,
+    scriptError,
+    instructionBudget,
+    outOfMemory,
+};
+
+/** Read-only diagnostics copied without entering Lua. */
+struct Snapshot final {
+    std::array<char, 256> lastError{};
+    std::uint64_t stateRevision{};
+    std::uint64_t callbacks{};
+    std::uint64_t committedCallbacks{};
+    std::uint64_t refusedCallbacks{};
+    std::uint64_t collections{};
+    std::uint32_t phase{};
+    std::size_t pendingIntents{};
+    std::size_t variableCount{};
+    std::size_t timerCount{};
+    std::uint64_t nextTimerSequence{state::activity::mission::kFirstTimerSequence};
+    std::uint64_t nextIntentKey{state::activity::mission::kFirstIntentKey};
+    std::int32_t initialStateRegion{-1};
+    std::size_t arenaBytes{};
+    std::size_t arenaHighWater{};
+    std::size_t arenaBytesAfterClose{};
+    bool active{};
+    bool faulted{};
+    bool hasInitialState{};
+};
+
+/** Noncopyable Lua state with a fixed arena and RAII-owned work queues. */
+class Vm final {
+public:
+    Vm() noexcept;
+    ~Vm() noexcept;
+    Vm(const Vm&) = delete;
+    Vm& operator=(const Vm&) = delete;
+
+private:
+    friend struct detail::VmAccess;
+
+    alignas(std::max_align_t) std::array<std::byte, kVmStorageByteCapacity> storage_{};
+};
+
+/**
+ * Compiles one text chunk in a scratch state and discards it. Runs no script code.
+ * @param chunkName Null-terminated name the error message quotes.
+ * @param error Receives the null-terminated compiler message on failure.
+ * @return False when the chunk does not compile.
+ */
+[[nodiscard]] bool
+check_syntax(std::span<const char> source, const char* chunkName, std::span<char> error) noexcept;
+
+/** Opens one text-only, build-matched program in a fresh sandbox. */
+[[nodiscard]] OpenStatus open(Vm& vm,
+                              const ProgramIdentity& identity,
+                              const DefinitionApi& definitions,
+                              std::span<const char> source) noexcept;
+
+/**
+ * Re-points an open program at a new bound view of the same source.
+ * @return False when no program is open.
+ */
+[[nodiscard]] bool
+rebind(Vm& vm, const ProgramIdentity& identity, const DefinitionApi& definitions) noexcept;
+/** Restores authoritative state and typed actions before the first callback. */
+[[nodiscard]] bool restore_state(Vm& vm,
+                                 std::uint32_t phase,
+                                 std::uint64_t revision,
+                                 std::span<const ScriptVariable> variables,
+                                 std::span<const MissionTimer> timers,
+                                 std::uint64_t nextTimerSequence,
+                                 std::uint64_t nextIntentKey,
+                                 std::span<const Intent> pendingIntents) noexcept;
+/** Restores authoritative state when no typed actions are pending. */
+[[nodiscard]] bool restore_state(Vm& vm, std::uint32_t phase, std::uint64_t revision) noexcept;
+/**
+ * Publishes the current peer set so any callback can read it, on_load included.
+ * It is instance state, so it persists until the next publish. Peers past kPeerCapacity are
+ * dropped, which is the same bound the roster itself carries.
+ */
+void publish_peers(Vm& vm, std::span<const PeerSession> peers) noexcept;
+/** Publishes the durable native attempt before any script callback reads it. */
+void publish_attempt(Vm& vm, state::activity::mission::AttemptState attempt) noexcept;
+/** Copies the latest native device requests without exposing their sequences to Lua. */
+[[nodiscard]] bool publish_device_requests(
+    Vm& vm, std::span<const state::activity::mission::DeviceRequestReport> requests) noexcept;
+/**
+ * Names the links whose device requests read as applied. A request is applied only by a report
+ * from the link it was pinned to, so one pinned to a link that has left is not read as applied.
+ */
+[[nodiscard]] bool publish_device_sources(Vm& vm,
+                                          std::span<const std::uint64_t> generations) noexcept;
+
+/** Copies the retained Ghost-link levels so a reloaded program can re-read them. */
+void publish_ghost_levels(Vm& vm, std::span<const GhostLinkRow> levels) noexcept;
+
+/** Copies the retained objective task counters so a callback can read any objective's. */
+void publish_objective_levels(Vm& vm, std::span<const ObjectiveLevelRow> levels) noexcept;
+
+/** Copies durable native population facts before any callback reads a cohort. */
+[[nodiscard]] bool publish_populations(
+    Vm& vm, std::span<const state::activity::mission::SquadPopulation> populations) noexcept;
+/** Runs the optional on_start(context, state) transaction. */
+[[nodiscard]] CallStatus start(Vm& vm, std::uint64_t now = 0) noexcept;
+/**
+ * Runs optional on_load(context, state) after same-session VM reattachment.
+ * It rebuilds only Lua-heap caches and reserves no revision.
+ */
+[[nodiscard]] CallStatus load(Vm& vm, std::uint64_t now = 0) noexcept;
+/** Runs the optional callback for the event's exact native kind. */
+[[nodiscard]] CallStatus dispatch(Vm& vm,
+                                  const host::Event& event,
+                                  const host::ClientMessageSnapshot* clientMessage = nullptr,
+                                  std::uint64_t now = 0) noexcept;
+/** @return True when the program declares the exact event callback. */
+[[nodiscard]] bool handles_event(const Vm& vm, host::EventKind kind) noexcept;
+/** Reads the optional effective region captured from program.initial_state.region_index. */
+[[nodiscard]] bool initial_state_region(const Vm& vm, std::int32_t& output) noexcept;
+/** Reads the optional spawn set captured from program.initial_state.spawn_set_hash. */
+[[nodiscard]] bool initial_state_spawn_set(const Vm& vm, std::uint32_t& output) noexcept;
+/** Copies the objects program.initial_state.omit keeps out of every seed; count may be zero. */
+[[nodiscard]] bool
+initial_state_omissions(const Vm& vm,
+                        std::span<state::activity::mission::MissionSeedOmission> output,
+                        std::size_t& count) noexcept;
+/** Copies the objects program.seed_omit keeps out of every adopted seed; count may be zero. */
+[[nodiscard]] bool
+program_seed_omissions(const Vm& vm,
+                       std::span<state::activity::mission::MissionSeedOmission> output,
+                       std::size_t& count) noexcept;
+/** Copies the oldest committed action without consuming it. */
+[[nodiscard]] bool pending_intent(const Vm& vm, Intent& output) noexcept;
+/** Copies the complete ordered outbox without consuming an action. */
+[[nodiscard]] bool snapshot_intents(const Vm& vm, std::vector<Intent>& output) noexcept;
+/** Copies complete durable variable and timer candidates without invoking Lua. */
+[[nodiscard]] bool snapshot_durable_state(const Vm& vm,
+                                          std::span<ScriptVariable> variables,
+                                          std::size_t& variableCount,
+                                          std::span<MissionTimer> timers,
+                                          std::size_t& timerCount,
+                                          std::uint64_t& nextTimerSequence,
+                                          std::uint64_t& nextIntentKey) noexcept;
+/** Removes the oldest action after a native adapter accepted it. */
+void consume_intent(Vm& vm) noexcept;
+/** Stops callbacks after an unrecoverable event or action failure. */
+void fault(Vm& vm, std::string_view reason) noexcept;
+/** Copies bounded diagnostics without invoking script code. */
+void snapshot(const Vm& vm, Snapshot& output) noexcept;
+/** Closes one state and releases every allocation back to its fixed arena. */
+void close(Vm& vm) noexcept;
+
+/** Exchanges prepared states only between callbacks; Lua ownership follows each moved arena. */
+[[nodiscard]] bool exchange(Vm& first, Vm& second) noexcept;
+/** Copies the attempt, ghost levels, objective counters and offers, and peers into a new VM. */
+[[nodiscard]] bool copy_inputs(const Vm& source, Vm& prepared) noexcept;
+/** True only for a mod whose file successfully loaded in this VM. */
+[[nodiscard]] bool uses_mod(const Vm& vm, std::string_view modId) noexcept;
+
+[[nodiscard]] const char* status_name(OpenStatus status) noexcept;
+[[nodiscard]] const char* status_name(CallStatus status) noexcept;
+
+} // namespace sunrise::server::activity::mission::lua_vm

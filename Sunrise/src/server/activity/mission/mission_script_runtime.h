@@ -1,0 +1,169 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string_view>
+
+#include "../../../state/activity/definition.h"
+
+namespace sunrise::server::activity::mission {
+
+/** Holds `<stem>/<stem>.lua` up to MAX_PATH; a longer path is reported empty. */
+inline constexpr std::size_t kControllerFileCapacity = 260;
+
+/** One bounded, value-owned diagnostic row for an attached mission program. */
+struct InstanceDiagnostics final {
+    state::activity::SessionBinding binding{};
+    std::array<char, 64> activityId{};
+    /** Controller path the program's own catalog names; a mod's row is not in the installed one. */
+    std::array<char, kControllerFileCapacity> controllerFile{};
+    std::array<char, 24> programStatus{};
+    std::array<char, 32> deliveryStage{};
+    std::array<char, 16> lastVmStage{};
+    std::array<char, 32> lastVmStatus{};
+    std::array<char, 256> lastVmError{};
+    std::uint64_t eventsSeen{};
+    std::uint64_t eventsCommitted{};
+    std::uint64_t lastMissionSequence{};
+    std::uint64_t vmStateRevision{};
+    std::uint64_t missionStateRevision{};
+    std::uint64_t activityStateRevision{};
+    std::uint64_t vmCallbacks{};
+    std::uint64_t vmCommittedCallbacks{};
+    std::uint64_t vmRefusedCallbacks{};
+    std::uint64_t intentsTransportStaged{};
+    std::uint64_t expectedScriptableRevision{};
+    std::uint32_t activityRow{};
+    std::uint32_t phase{};
+    std::uint32_t intentAttempts{};
+    std::uint32_t startAttempts{};
+    std::size_t pendingIntents{};
+    std::size_t pendingEvents{};
+    bool missionStateBound{};
+    bool missionStarted{};
+    bool vmActive{};
+    bool vmFaulted{};
+};
+
+/** One bounded, value-owned result from attaching Mission Lua to an exact Host generation. */
+struct AttachDiagnostics final {
+    state::activity::SessionBinding binding{};
+    /** Stable attach-result class, such as `ready`, `no_activity_link`, or `sdk_status`. */
+    std::array<char, 32> result{};
+    /** Exact refusal detail; SDK failures carry their stable SDK status name here. */
+    std::array<char, 32> detail{};
+    /** One-based SDK activity row when resolution reached an exact activity. */
+    std::uint32_t activityRow{};
+    bool hasActivityRow{};
+    /** Controller path of that activity, read from the catalog that resolved it. */
+    std::array<char, kControllerFileCapacity> controllerFile{};
+};
+
+/** One fixed-capacity copy of all attached mission-program diagnostics. */
+struct DiagnosticsSnapshot final {
+    std::array<InstanceDiagnostics, state::activity::kSessionCapacity> instances{};
+    /** One row per Host generation plus one possible runtime-capacity refusal. */
+    std::array<AttachDiagnostics, state::activity::kSessionCapacity + 1> attaches{};
+    std::size_t instanceCount{};
+    std::size_t attachCount{};
+    bool enabled{};
+    bool pathReady{};
+};
+
+/** Generation-pinned actor command accepted by a gameplay policy provider. */
+struct ActorCommandPolicyRequest final {
+    state::activity::SessionBinding binding{};
+    /** Build digest of the pack the activity is bound to: installed, or a mod's own. */
+    std::array<std::byte, 32> sdkBuildSha256{};
+    std::uint64_t activityClientGeneration{};
+    /** Squad row of that pack. */
+    std::uint32_t squadRow{};
+    /** Command row of the installed pack. */
+    std::uint32_t commandRow{};
+    std::uint32_t commandSelector{};
+    std::int32_t value{};
+};
+
+enum class ActorCommandPolicyStatus : std::uint8_t {
+    queued,
+    unavailable,
+    refused,
+};
+
+using ActorCommandPolicy = ActorCommandPolicyStatus (*)(
+    const void* context, const ActorCommandPolicyRequest& request) noexcept;
+
+/** Installs the gameplay-owned policy callback before mission service starts. */
+void install_actor_command_policy(const void* context, ActorCommandPolicy policy) noexcept;
+
+/** Publishes accepted gameplay damage only to the mission's matching source generation. */
+void report_squad_provoked(const state::activity::SessionBinding& binding,
+                           std::uint64_t sourceGeneration,
+                           std::uint32_t registryKey,
+                           std::uint16_t slotIndex) noexcept;
+
+/**
+ * Publishes an authored actor's replicated damage levels as a damageState event when they change.
+ * Levels are ten-bit fractions of full (1023).
+ */
+void report_squad_damage(const state::activity::SessionBinding& binding,
+                         std::uint64_t sourceGeneration,
+                         std::uint32_t registryKey,
+                         std::uint8_t slotType,
+                         std::uint16_t slotIndex,
+                         std::uint16_t health,
+                         std::uint16_t shield) noexcept;
+
+/** Starts the server mission-script manager when its setting is enabled. */
+void initialize() noexcept;
+/** Runs one bounded event/reducer/output slice after Activity Host ingress. */
+void service(std::uint64_t now) noexcept;
+/** Copies mission-program state without invoking Lua or changing delivery state. */
+void snapshot(DiagnosticsSnapshot& output) noexcept;
+
+/** How one reload request ended. */
+enum class ReloadStatus : std::uint8_t {
+    pending,
+    ok,
+    /** Mission scripting is off or its paths did not resolve. */
+    disabled,
+    /** A new controller does not compile; every old program keeps running. */
+    compileError,
+    /** Preparation or publication was refused; old programs remain in place. */
+    failed,
+    /** A newer request took the mailbox before this one was answered. */
+    replaced,
+    /** The requester left before publication started. */
+    cancelled,
+};
+
+/** The answer to one reload request. */
+struct ReloadResult final {
+    ReloadStatus status{ReloadStatus::pending};
+    /** Programs that reopened and are running again. */
+    std::uint32_t reopened{};
+    std::array<char, 192> message{};
+};
+
+/** Checks requester lifetime before commit; it must not call any reload API. */
+using ReloadRequester = bool (*)(std::uint64_t ticket) noexcept;
+
+/**
+ * Prepares replacements from disk and adopts them together at their next safe point.
+ * Safe means no delivery, intent, input, timer or script event is in flight.
+ * @param modId Reopens this mod's controllers and library users, including its dependents.
+ * Empty means every program.
+ * @return The ticket `reload_result` answers; a newer request replaces an unanswered one.
+ */
+[[nodiscard]] std::uint64_t request_reload(std::string_view modId,
+                                           ReloadRequester requester = nullptr) noexcept;
+/** Cancels only this pending ticket; a committed or newer request is untouched. */
+[[nodiscard]] bool cancel_reload(std::uint64_t ticket) noexcept;
+/** @return The answer for one ticket; `pending` until the server thread has answered it. */
+[[nodiscard]] ReloadResult reload_result(std::uint64_t ticket) noexcept;
+/** Closes every per-activity Lua state and clears its event cursor. */
+void shutdown() noexcept;
+
+} // namespace sunrise::server::activity::mission

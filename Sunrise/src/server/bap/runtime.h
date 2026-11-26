@@ -1,0 +1,503 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+
+#include "../../client/network/consumer.h"
+#include "../../middleware/bap/activity_message/activity_patch_epoch_parser.h"
+#include "../../middleware/bap/activity_message/scriptable_auth_body.h"
+#include "../../middleware/gameplay/descriptor/join_descriptor.h"
+#include "../../state/activity/definition.h"
+#include "../../state/activity_sdk/runtime.h"
+#include "../../state/runtime/state.h"
+#include "../activity/host_runtime.h"
+#include "activity_authority_query.h"
+#include "activity_authority_reset.h"
+
+namespace sunrise::server::bap {
+
+/** Services shared-service links under the same lock as native request and nonce publication. */
+void service(std::uint64_t now) noexcept;
+
+/** Makes the next investment refresh pump take one more slice. */
+using InvestmentSliceConsumer = void (*)() noexcept;
+
+/**
+ * Registers the Client's slice consumer; the Client sets it once at activation.
+ * @param slice Extra investment refresh slice request.
+ * @return False when the consumer is null or the slot is already taken.
+ */
+[[nodiscard]] bool
+register_client_investment_slice_consumer(InvestmentSliceConsumer slice) noexcept;
+
+/** Clears the Client's slice consumer at Client shutdown. */
+void unregister_client_investment_slice_consumer() noexcept;
+
+/** Asks for one more investment refresh slice. Does nothing while no Client is registered. */
+void request_investment_slice() noexcept;
+
+/** Queues the committed account graph for every authenticated Family-4 peer. */
+[[nodiscard]] bool request_account_resync() noexcept;
+
+/**
+ * Grants the perks the selected character earned once the rows the walk reads are published.
+ * Takes the session lock, so the caller must hold no lock the Server takes under it.
+ */
+void grant_published_season_perks() noexcept;
+
+/** Read-only eligibility state from one exact authenticated ActivityClient link. */
+struct ActivityLinkView final {
+    std::size_t matchingLinks{};
+    std::uint64_t activityClientGeneration{};
+    std::int32_t effectiveRegion{-1};
+    /** Exact package slice set retained from the client's D6 teleport state. */
+    std::int32_t sliceSetIndex{-1};
+    /** Destination arrival slice committed before the client can send D6. */
+    std::int32_t arrivalSliceSetIndex{-1};
+    /** True when the region is live connection state rather than an arrival fallback. */
+    bool effectiveRegionReported{};
+    /** The private ActivityClient completed its entity-slot join for this exact generation. */
+    bool joined{};
+    bool publicTarget{};
+    /** Last roster-build outcome reported on this link, for atomic diagnostics. */
+    std::uint8_t rosterReason{};
+    /** The player key this link's message 5 binds, which the client matches on its own datum. */
+    std::uint64_t playerKey{};
+};
+
+/** The private link beside one public link. */
+struct PublicLinkOwner final {
+    state::activity::SessionBinding binding{};
+    /** ActivityClient generation of the same account's joined private link. */
+    std::uint64_t activityClientGeneration{};
+    /** Region the public link stands in. */
+    std::int32_t publicRegion{-1};
+    /** Region the private link selects. */
+    std::int32_t privateRegion{-1};
+};
+
+/** The active ActivityClient selected for a local world slice. */
+struct CurrentActivityLinkView final {
+    state::activity::SessionBinding binding{};
+    std::uint64_t activityClientGeneration{};
+    std::size_t activeLinks{};
+    std::size_t matchingRegions{};
+    std::int32_t effectiveRegion{-1};
+    bool publicTarget{};
+};
+
+/** Common-root inputs owned by one exact ActivityClient generation. */
+struct ActivityReplicationView final {
+    state::activity::SessionBinding binding{};
+    middleware::bap::activity_message::patch_epoch::PatchEpoch patchEpoch{};
+    std::uint64_t activityClientGeneration{};
+    std::uint64_t groupSessionId{};
+    std::uint64_t memberId{};
+    std::uint8_t replicationEpoch{};
+};
+
+/** Exact generated Auth-mapping selection retained by one ActivityClient lease. */
+struct ActivityMissionSeedPlan final {
+    /** Objects the mission left out of this seed. Empty means the whole selected state. */
+    std::array<state::activity_sdk::MissionSeedOmission,
+               state::activity_sdk::kMissionSeedOmitCapacity>
+        omissions{};
+    std::uint32_t omissionCount{};
+    std::uint32_t activityRow{0xFFFFFFFFU};
+    std::uint32_t scenarioRow{0xFFFFFFFFU};
+    std::uint32_t stateRow{0xFFFFFFFFU};
+    std::uint32_t bubbleRow{0xFFFFFFFFU};
+    std::uint32_t bubbleOrdinal{0xFFFFFFFFU};
+    std::uint32_t stateOrdinal{};
+    std::uint32_t entryIndex{};
+    std::uint32_t sliceSetIndex{};
+    std::uint32_t effectiveRegion{};
+    std::uint32_t occurrenceCount{};
+    std::uint32_t groupCount{};
+    std::uint32_t authMappingSlots{};
+    std::uint32_t authResetSlots{};
+    std::uint32_t senseSuppressedSlots{};
+};
+
+/** Stable transport-side outcome for reading the automatic selected-state roster publication. */
+enum class ActivityMissionSeedLeaseStatus : std::uint8_t {
+    ready,
+    noActivityLink,
+    staleActivityClient,
+    wrongScenario,
+    missingLiveSliceSet,
+    wrongSliceSet,
+    outputBusy,
+    refused,
+};
+
+/** Read-only state of one connection-scoped SDK selected-state roster lease. */
+struct ActivityMissionSeedLeaseView final {
+    ActivityMissionSeedPlan plan{};
+    std::size_t matchingLinks{};
+    std::uint64_t activityClientGeneration{};
+    std::uint64_t revision{};
+    std::uint64_t publishedRevision{};
+    bool configured{};
+    bool publicationPending{};
+    /** True when the roster could not build this revision's body, so it never publishes. */
+    bool publicationRefused{};
+    /** True while the selection's publication deliberately waits for the client's arrival. */
+    bool regionArrivalPending{};
+};
+
+/**
+ * True once every link hosting the script-selected state's bubble has its native decode groups.
+ * @param everyClient True also waits for a client with no link in that bubble to arrive; false
+ * does not, for output that nothing can carry into a bubble no client hosts.
+ */
+[[nodiscard]] bool mission_seed_publication_ready(const state::activity::SessionBinding& binding,
+                                                  std::uint64_t generation,
+                                                  bool everyClient) noexcept;
+
+/** Arms the authored region transition in each private member's own membership scope. */
+[[nodiscard]] bool arm_shared_mission_region(const state::activity::SessionBinding& binding,
+                                             std::uint64_t generation,
+                                             std::int32_t region,
+                                             std::uint32_t nameHash,
+                                             bool sameRegion = false) noexcept;
+
+/** Applies one connection-scoped BAP lifecycle event. */
+[[nodiscard]] bool consume(const client::network::BapRequest& request,
+                           client::network::BapResponse& response) noexcept;
+
+/** Counts authenticated BAP links that currently own one exact activity generation. */
+[[nodiscard]] std::size_t
+activity_link_count(const state::activity::SessionBinding& binding) noexcept;
+
+/**
+ * Reads the unique matching ActivityClient and the exact region its msg-5 builder will use.
+ * @param binding Exact Activity Host generation selected by the caller.
+ * @param output Cleared, then receives the link count, nonzero generation, and connection fields.
+ * @return True only when exactly one authenticated ActivityClient owns the binding.
+ */
+[[nodiscard]] bool activity_link_view(const state::activity::SessionBinding& binding,
+                                      ActivityLinkView& output) noexcept;
+
+/**
+ * Finds the private link beside one public link: the same account's joined private ActivityClient.
+ * @param publicGeneration ActivityClient generation of the public link that reported.
+ * @return True when both links are current and each is the only match.
+ */
+[[nodiscard]] bool public_link_owner(const state::activity::SessionBinding& publicBinding,
+                                     std::uint64_t publicGeneration,
+                                     PublicLinkOwner& output) noexcept;
+
+/** Selects a joined delivery route for the activity's single mission program. */
+[[nodiscard]] bool mission_activity_link_view(const state::activity::SessionBinding& binding,
+                                              ActivityLinkView& output) noexcept;
+
+/**
+ * Lists the joined private links that can carry the mission program's output. The host applies an
+ * output in the bubble that owns its target, so the link whose client holds that bubble carries it;
+ * the program's route is only one of them.
+ * @param preferred Generations listed first, in this order, when each is a joined private link.
+ * @param routeGeneration The program's route, listed next under the same condition.
+ * @param output Receives those, then the other links by ascending generation, each once; public
+ * targets, unjoined links and generations two links claim are left out.
+ * @return The number of views written, at most output.size().
+ */
+[[nodiscard]] std::size_t mission_route_candidates(const state::activity::SessionBinding& binding,
+                                                   std::span<const std::uint64_t> preferred,
+                                                   std::uint64_t routeGeneration,
+                                                   std::span<ActivityLinkView> output) noexcept;
+
+/** Exact committed player identity; duplicate or loading links do not supply life evidence. */
+[[nodiscard]] bool mission_member_link_view(const state::activity::SessionBinding& binding,
+                                            const state::activity::membership::Identity& identity,
+                                            ActivityLinkView& output) noexcept;
+
+/** Resolves one native client generation without requiring other players to leave the activity. */
+[[nodiscard]] bool activity_link_view(const state::activity::SessionBinding& binding,
+                                      std::uint64_t generation,
+                                      ActivityLinkView& output) noexcept;
+
+/** Resolves the native member that owns a new mission program to one exact live generation. */
+[[nodiscard]] bool activity_link_view_for_member(const state::activity::SessionBinding& binding,
+                                                 std::uint64_t memberKey,
+                                                 ActivityLinkView& output) noexcept;
+
+/** Reads one exact ActivityClient's connection-scoped SDK selected-state roster lease. */
+[[nodiscard]] ActivityMissionSeedLeaseStatus
+activity_mission_seed_lease(const state::activity::SessionBinding& binding,
+                            std::uint32_t scenarioRow,
+                            std::uint64_t expectedGeneration,
+                            ActivityMissionSeedLeaseView& output) noexcept;
+
+/** Replaces one exact ActivityClient's selected-state roster lease with a materialized plan. */
+[[nodiscard]] ActivityMissionSeedLeaseStatus
+select_activity_mission_seed(const state::activity::SessionBinding& binding,
+                             const ActivityMissionSeedPlan& plan,
+                             std::uint64_t expectedGeneration) noexcept;
+
+/** Read-only check of a canonical type-23 target on one live ActivityClient generation. */
+[[nodiscard]] bool
+activity_type23_override_available(const state::activity::SessionBinding& binding,
+                                   const activity::host::ScriptableTarget& target,
+                                   std::int32_t expectedRegion,
+                                   std::uint64_t expectedGeneration) noexcept;
+
+/**
+ * Selects the live ActivityClient whose msg-5 region matches the client's local slice set.
+ * One active link is accepted without a match. Multiple unmatched or multiply matched links are
+ * ambiguous and return false instead of being ordered by their session ids.
+ */
+[[nodiscard]] bool current_activity_link_view(std::int32_t localSliceSet,
+                                              CurrentActivityLinkView& output) noexcept;
+
+/** Reads the unique ActivityClient whose activity session is the supplied view token. */
+[[nodiscard]] bool activity_replication_view_for_session(std::uint64_t activitySessionId,
+                                                         ActivityReplicationView& output) noexcept;
+
+/** Reads the unique ActivityClient bound to one gameplay group session. */
+[[nodiscard]] bool activity_replication_view_for_group(std::uint64_t groupSessionId,
+                                                       ActivityReplicationView& output) noexcept;
+/** Resolves a private view by the complete native address published by its own current link. */
+[[nodiscard]] bool activity_replication_view_for_address(
+    std::uint64_t activitySessionId,
+    const std::array<std::byte, middleware::gameplay::descriptor::kNetAddrSize>& address,
+    ActivityReplicationView& output) noexcept;
+/** Exact native player ownership resolves a view when several accounts share its session. */
+[[nodiscard]] bool activity_replication_view_for_session(std::uint64_t activitySessionId,
+                                                         std::uint64_t accountSoid,
+                                                         std::uint64_t characterSoid,
+                                                         ActivityReplicationView& output) noexcept;
+/** Exact native player ownership resolves a view when several accounts share its group. */
+[[nodiscard]] bool activity_replication_view_for_group(std::uint64_t groupSessionId,
+                                                       std::uint64_t accountSoid,
+                                                       std::uint64_t characterSoid,
+                                                       ActivityReplicationView& output) noexcept;
+
+/** Queues activity message 44 on one exact ActivityClient generation. */
+[[nodiscard]] bool request_replication_epoch(const state::activity::SessionBinding& binding,
+                                             std::uint64_t expectedGeneration,
+                                             std::uint8_t requestedEpoch) noexcept;
+
+/**
+ * Queues one msg-30 readback on an exact unique ActivityClient link.
+ * TODO: no caller until fireteam departure cleanup lands; this and the three below wait on it.
+ */
+[[nodiscard]] ActivityAuthorityQueryStatus
+request_activity_authority_query(const state::activity::SessionBinding& binding,
+                                 std::uint64_t expectedGeneration,
+                                 std::int32_t& correlation) noexcept;
+
+/** Copies one complete connection-owned authority readback. */
+[[nodiscard]] ActivityAuthorityQueryStatus
+activity_authority_query_snapshot(const state::activity::SessionBinding& binding,
+                                  std::uint64_t expectedGeneration,
+                                  ActivityAuthorityQuerySnapshot& output) noexcept;
+
+/** Queues one msg-28 authority-mask rebuild on an exact unique ActivityClient link. */
+[[nodiscard]] ActivityAuthorityResetStatus
+request_activity_authority_reset(const state::activity::SessionBinding& binding,
+                                 std::uint64_t expectedGeneration,
+                                 std::int32_t& correlation) noexcept;
+
+/** Copies one complete connection-owned authority-reset result. */
+[[nodiscard]] ActivityAuthorityResetStatus
+activity_authority_reset_snapshot(const state::activity::SessionBinding& binding,
+                                  std::uint64_t expectedGeneration,
+                                  ActivityAuthorityResetSnapshot& output) noexcept;
+
+/** Queues a type-23 override only while the requested authenticated client generation owns the
+ * binding. */
+[[nodiscard]] bool request_activity_type23_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    middleware::bap::activity_message::scriptable_auth::Type23Channel channel,
+    float value,
+    bool snap,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
+
+/** Queues one activity lifetime change while the requested authenticated client generation owns the
+ * binding. */
+[[nodiscard]] bool request_activity_lifetime_override(
+    const state::activity::SessionBinding& binding,
+    std::uint8_t lifetimeState,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
+
+/** Queues one activity flag change while the requested client generation owns the binding. */
+[[nodiscard]] bool request_activity_flag_override(
+    const state::activity::SessionBinding& binding,
+    const middleware::bap::activity_message::sensor_auth_update::ActivityFlagChange& change,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
+
+/** Queues a generated type-23 update while its exact mission-seed state is live. */
+[[nodiscard]] bool request_activity_state_local_type23_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup& stateLocalRosterGroup,
+    middleware::bap::activity_message::scriptable_auth::Type23Channel channel,
+    float value,
+    bool snap,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
+
+/** Queues one structurally compiled SDK Auth body through the durable message-5 lane. */
+[[nodiscard]] bool request_activity_sdk_auth_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup* stateLocalRosterGroup,
+    std::span<const std::byte> body,
+    std::uint16_t bitCount,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr,
+    activity::host::ScriptableOverrideKind kind =
+        activity::host::ScriptableOverrideKind::sdkAuth) noexcept;
+
+/** Queues a type-31 arm or disarm only while the requested authenticated client generation owns the
+ * binding. */
+[[nodiscard]] bool request_activity_type31_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr,
+    bool enabled = true) noexcept;
+
+/** Queues a generated state-local type-31 pulse while its exact mission-seed state is live. */
+[[nodiscard]] bool request_activity_state_local_type31_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup& stateLocalRosterGroup,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr,
+    bool enabled = true) noexcept;
+
+/** Queues one authored sequence start or choice change while its mission-seed state is live. */
+[[nodiscard]] bool request_activity_state_local_sequence_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup& stateLocalRosterGroup,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr,
+    const middleware::bap::activity_message::scriptable_auth::Type5Selection& selection =
+        {}) noexcept;
+
+/** Queues one authored cinematic start or stop while its mission-seed state is live. */
+[[nodiscard]] bool request_activity_state_local_cinematic_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup& stateLocalRosterGroup,
+    bool active,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
+
+/** Queues one type-42 performance start while its mission-seed state is live. */
+[[nodiscard]] bool request_activity_state_local_performance_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup& stateLocalRosterGroup,
+    std::uint32_t stateNameHash,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
+
+/** Queues one authored-scene activation only while its exact mission-seed state is live. */
+[[nodiscard]] bool request_activity_state_local_authored_scene_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup& stateLocalRosterGroup,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr,
+    const activity::host::AuthoredSceneDependencies& dependencies = {},
+    std::uint32_t eventKey = 0,
+    bool stop = false,
+    std::uint32_t initialEventKey = 0) noexcept;
+
+/** Queues one authored dialogue line only while its exact mission-seed state is live. */
+[[nodiscard]] bool request_activity_state_local_dialogue_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup& stateLocalRosterGroup,
+    std::uint16_t cueIndex,
+    std::uint16_t authoredCueCount,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr,
+    middleware::bap::activity_message::scriptable_auth::Type2LaneClientRef filter = {}) noexcept;
+
+/** Queues one objective reset only while its exact mission-seed state is live. */
+[[nodiscard]] bool request_activity_state_local_objective_reset(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup& stateLocalRosterGroup,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
+
+/** Queues one authored task only while its exact mission-seed state is live. */
+[[nodiscard]] bool request_activity_state_local_task_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup& stateLocalRosterGroup,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
+
+/** Queues a squad placement only while the requested authenticated client generation owns the
+ * binding. */
+[[nodiscard]] bool request_activity_squad_override(
+    const state::activity::SessionBinding& binding,
+    const activity::host::ScriptableTarget& target,
+    const state::build_data::scenarios::RosterGroup* stateLocalRosterGroup,
+    std::span<const std::int32_t> requestedCounts,
+    middleware::bap::activity_message::squad_auth::Mode mode,
+    std::optional<std::uint32_t> nameHash,
+    std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
+    const activity::host::ScriptableOutputReservation* reservation = nullptr,
+    std::array<std::int8_t, 4> authoredProfile = {},
+    state::gameplay::squad_entity_retirement::Eligibility squadRetirement = {},
+    std::optional<middleware::bap::activity_message::squad_auth::Destination> destination =
+        std::nullopt,
+    std::optional<middleware::bap::activity_message::squad_auth::SpawnRule> spawnRule =
+        std::nullopt,
+    std::optional<middleware::bap::activity_message::squad_auth::Temperaments> temperaments =
+        std::nullopt) noexcept;
+
+/** Cancels one exact typed override revision while excluding activity-link publication. */
+[[nodiscard]] bool
+cancel_activity_scriptable_override(const state::activity::SessionBinding& binding,
+                                    std::uint64_t expectedRevision) noexcept;
+
+#if defined(SUNRISE_BAP_FRAME_TEST)
+/**
+ * Copies one connection's own send nonce and AES-GCM session key.
+ * Test-only: a key export must not ship, so the production DLL compiles this out. The hello
+ * generates this material per connection and never puts it in State, so a fixture has no other way.
+ * @param connectionId Nonzero connection slot.
+ * @param sendNonce Gets the server-direction nonce this connection will seal with next.
+ * @param sessionKey Gets this connection's own key.
+ * @return True only when the slot is open and its server hello has armed the channel.
+ */
+[[nodiscard]] bool session_channel(std::uint32_t connectionId,
+                                   std::array<std::byte, state::kBapNonceSize>& sendNonce,
+                                   std::array<std::byte, state::kAesKeySize>& sessionKey) noexcept;
+#endif
+
+/** Wipes every connection-owned nonce and transform buffer. */
+void shutdown() noexcept;
+
+} // namespace sunrise::server::bap

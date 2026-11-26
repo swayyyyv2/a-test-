@@ -1,0 +1,26 @@
+/.vs/
+/.idea/
+/.vscode/
+/.direnv/
+/.xwin-cache
+/.cache/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.aps
+*.log
+/Sunrise/build/
+
+# Game-derived resource data stays local; supply it from your own asset workflow.
+/Sunrise/resources/bootflow/*.dds
+/Sunrise/resources/item_icons.pack
+/Sunrise/resources/item_names.bin
+/Sunrise/resources/item_rarity.bin
+/Sunrise/resources/database/investment_defaults.sql
+
+# CMake build files
+/build/
+/out/
+/docs/
+/Sunrise/docs/

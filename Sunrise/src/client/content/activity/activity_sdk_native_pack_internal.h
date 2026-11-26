@@ -1,0 +1,107 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <span>
+#include <vector>
+
+#include "activity_sdk_authored_scene_inventory.h"
+#include "activity_sdk_incident_inventory.h"
+#include "activity_sdk_native_pack_pipeline.h"
+#include "activity_sdk_squad_inventory.h"
+#include "activity_sdk_topology_enrichment.h"
+
+namespace sunrise::client::content::activity::sdk_generation::native_pack_pipeline {
+
+namespace reader = middleware::content::packages::reader;
+namespace authored_scene = authored_scene_inventory;
+namespace squads = squad_inventory;
+namespace topology_enrichment = sdk_generation::topology_enrichment;
+
+/** One cache-owning package reader shared by squad and authored-scene extraction. */
+struct PackageContext final {
+    const reader::Source* source{};
+    std::unique_ptr<reader::Scratch> scratch{};
+    CancelProbe cancel{};
+    void* cancelContext{};
+
+    ~PackageContext() noexcept {
+        if (scratch != nullptr) {
+            reader::close_files(*scratch);
+        }
+    }
+};
+
+/** Reads one unaligned value. @return False when it does not fit the bytes. */
+template <typename Value>
+[[nodiscard]] bool
+read_value(std::span<const std::byte> bytes, std::size_t offset, Value& output) noexcept {
+    output = {};
+    if (offset > bytes.size() || sizeof output > bytes.size() - offset) {
+        return false;
+    }
+    std::memcpy(&output, bytes.data() + offset, sizeof output);
+    return true;
+}
+
+/** One package tag read once per pass, with its physical class. */
+struct CachedTag final {
+    std::vector<std::byte> bytes{};
+    std::uint32_t classId{};
+};
+
+/** @return True when the caller asked this pass to stop. */
+[[nodiscard]] bool cancelled(CancelProbe probe, void* context) noexcept;
+
+/** Adapts the checked package reader to the squad and authored-scene boundaries. */
+[[nodiscard]] bool read_tag(void* opaque,
+                            std::uint32_t tag,
+                            std::vector<std::byte>& bytes,
+                            std::uint32_t& classId) noexcept;
+
+/** Reads one tag only when its physical class matches the typed edge being followed. */
+[[nodiscard]] bool read_localized_tag(void* opaque,
+                                      std::uint32_t tag,
+                                      std::uint32_t expectedClass,
+                                      std::vector<std::byte>& bytes) noexcept;
+
+/** Extracts localized dialogue aliases and safe authored directive elements. */
+[[nodiscard]] bool attach_authored_text(const topology_inventory::Snapshot& topology,
+                                        const topology_enrichment::Snapshot& enrichment,
+                                        const squads::Facts& facts,
+                                        PackageContext& packageContext,
+                                        authored_scene::Snapshot& output);
+
+/** Extracts the groups each exact combat objective can assign to a squad. */
+[[nodiscard]] bool attach_combat_objective_groups(const topology_inventory::Snapshot& topology,
+                                                  const squads::Facts& facts,
+                                                  PackageContext& packageContext,
+                                                  authored_scene::Snapshot& output);
+
+/** Resolves the native type-53 authored list and attaches its exact bound to the SDK slot row. */
+[[nodiscard]] bool attach_dialogue_cue_counts(const topology_inventory::Snapshot& topology,
+                                              const squads::Facts& facts,
+                                              PackageContext& packageContext,
+                                              topology_enrichment::Snapshot& enrichment);
+
+/** Extracts the eased output count from each channel sensor's exact target object. */
+[[nodiscard]] bool attach_object_channel_counts(const topology_inventory::Snapshot& topology,
+                                                const squads::Facts& facts,
+                                                PackageContext& packageContext,
+                                                topology_enrichment::Snapshot& enrichment);
+
+/**
+ * Reads the SObject table's notification rows and names each one by the English text its name
+ * hash keys in an installed string bank. Rows without text are left out.
+ */
+[[nodiscard]] bool build_incident_definitions(PackageContext& packageContext,
+                                              incident_inventory::Snapshot& output);
+
+/** Marks the SDK slot row of every type-43 scene whose descriptor names no resource. */
+[[nodiscard]] bool attach_unresourced_scenes(const topology_inventory::Snapshot& topology,
+                                             const authored_scene::Snapshot& scenes,
+                                             topology_enrichment::Snapshot& enrichment) noexcept;
+
+} // namespace sunrise::client::content::activity::sdk_generation::native_pack_pipeline
